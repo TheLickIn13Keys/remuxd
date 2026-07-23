@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "remuxd"
+version = "0.1.0"
+description = "On-demand remux/transcode of arbitrary video URLs to seekable HLS."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["hls", "remux", "ffmpeg", "transcode", "mkv", "streaming"]
+dependencies = []   # stdlib only; needs ffmpeg + ffprobe on PATH at runtime
+
+[project.scripts]
+remuxd = "remuxd.server:main"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+remuxd = ["assets/*"]
