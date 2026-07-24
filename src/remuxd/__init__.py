@@ -1,8 +1,8 @@
-"""remuxd — on-demand remux/transcode of arbitrary video URLs to HLS.
+"""remuxd: on-demand remux/transcode of arbitrary video URLs to HLS.
 
 Point it at any http(s) MKV/MP4/WebM and it probes the source, decides whether
 the browser can stream-copy the codecs (fast, lossless) or must transcode, then
-serves a seekable HLS stream — plus extracted text subtitles and embedded fonts.
+serves a seekable HLS stream, plus extracted text subtitles and embedded fonts.
 
 Public API (stable):
     from remuxd import Config, Engine, SessionManager

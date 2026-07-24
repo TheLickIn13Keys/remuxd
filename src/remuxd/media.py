@@ -1,6 +1,6 @@
 """Media inspection + ffmpeg command construction.
 
-Pure functions over ffprobe/ffmpeg — probe a source, decide copy-vs-transcode,
+Pure functions over ffprobe/ffmpeg: probe a source, decide copy-vs-transcode,
 build the argv for the HLS remux and per-segment fragment remux. No global state.
 """
 import json
@@ -158,7 +158,7 @@ def build_hls_cmd(ffmpeg: str, url: str, out_dir: str, mode: str,
         "-map", "0:v:0", "-map", amap,
         *vopt, *aopt,
         # MPEG-TS segments (not fMP4): one continuous ffmpeg produces contiguous,
-        # non-overlapping segments, so there's no DTS-seam problem to solve — and
+        # non-overlapping segments, so there's no DTS-seam problem to solve, and
         # TS avoids the fMP4 sidx boxes that Chrome's MSE parser rejects. event
         # playlist keeps all segments + writes ENDLIST at the end.
         "-f", "hls", "-hls_time", "6", "-hls_playlist_type", "event",

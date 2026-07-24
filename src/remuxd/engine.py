@@ -35,7 +35,7 @@ class _PrepEntry:
     """Memoized per-source prep. final/fsize/probed are filled at start; windows +
     header_bytes are filled lazily by the seek path. Byte offsets and header bytes
     stay valid even if the CDN link later expires (same file), so only the URL may
-    need a re-resolve — which fragment() already handles."""
+    need a re-resolve, which fragment() already handles."""
     __slots__ = ("final", "fsize", "probed", "windows", "header_bytes", "ts")
 
     def __init__(self, final, fsize, probed, ts):
@@ -88,11 +88,11 @@ class Engine:
         key = (src, tuple(sorted((headers or {}).items())))
         entry = self._prep_get(key)
         if entry is not None:
-            # repeat /start on this src (audio switch, replay) — skip resolve+probe
+            # repeat /start on this src (audio switch, replay): skip resolve+probe
             final, fsize, probed = entry.final, entry.fsize, entry.probed
             tl.lap("prep_cache")
         else:
-            # Resolve the debrid/redirect URL to the real CDN link ONCE — these re-run
+            # Resolve the debrid/redirect URL to the real CDN link ONCE: these re-run
             # a lookup per hit and 429 if touched repeatedly. Capture the file size from
             # the same response (Content-Range) instead of probing it again later.
             final, fsize = resolve_final(src, cfg.user_agent, headers)
@@ -244,7 +244,7 @@ class Engine:
     # (a waiter that gives up before the producer's deadline duplicates its work).
     FRAGMENT_TIMEOUT = 180
 
-    # Minimum seconds between debrid-resolver lookups per session — a dead link
+    # Minimum seconds between debrid-resolver lookups per session. A dead link
     # plus the prefetch worker's retries would otherwise hammer it into 429s.
     _REFRESH_COOLDOWN = 30.0
 
@@ -317,7 +317,7 @@ class Engine:
 
         err_buf = []
         # Until feeder.start() succeeds nothing else will ever close `resp`, so
-        # everything up to the handoff has to clean up after itself — otherwise a
+        # everything up to the handoff has to clean up after itself; otherwise a
         # failure here (no ffmpeg, thread limit) leaks a pooled connection and
         # orphans the child.
         try:
@@ -369,7 +369,7 @@ class Engine:
         return init, media_bytes, None
 
     def serve_segment(self, sess: Session, i: int) -> Optional[bytes]:
-        """Fragment i for a seek session — from the read-ahead cache if warm, from
+        """Fragment i for a seek session: from the read-ahead cache if warm, from
         an in-flight producer if one is already fetching it (wait, don't re-fetch),
         else produced on demand. Moves the playhead so the worker reads ahead."""
         if i < 0 or i >= len(sess.windows):
@@ -388,7 +388,7 @@ class Engine:
         if not should:
             if ev is None:      # raced with a producer: cached between get and claim
                 return sess.cache.get(i)
-            # someone else (usually the prefetch worker) is already fetching it —
+            # someone else (usually the prefetch worker) is already fetching it;
             # wait for their result instead of re-downloading the same bytes. The
             # wait must outlast the producer's ffmpeg deadline or we'd duplicate
             # work the producer is still doing.
@@ -400,7 +400,7 @@ class Engine:
             should, _ev = sess.cache.claim(i)   # producer failed/evicted -> take over
             if not should:
                 # cached in the meantime, or a producer is somehow still running
-                # past its deadline — either way don't pile on another fetch.
+                # past its deadline. Either way, don't pile on another fetch.
                 return sess.cache.get(i)
 
         try:
@@ -420,7 +420,7 @@ class Engine:
 
     def serve_init(self, sess: Session):
         """The shared init.mp4 (ftyp+moov). Produced by warming segment 0 through the
-        cache, so it shares the fetch with prefetch instead of duplicating it —
+        cache, so it shares the fetch with prefetch instead of duplicating it.
         serve_segment sets sess.init as a side effect."""
         if sess.init is None:
             self.serve_segment(sess, 0)
@@ -430,7 +430,7 @@ class Engine:
     # fetched to produce it aren't retained), so this is cheap.
     _SUBWIN_CACHE_MAX = 64
 
-    # Seconds ahead of a requested window to warm in the background — playback
+    # Seconds ahead of a requested window to warm in the background: playback
     # runs off the end of a window faster than the next one takes to fetch.
     _SUBWIN_AHEAD = 45.0
 
@@ -466,7 +466,7 @@ class Engine:
                     done = threading.Event()
                     sess.subwin_inflight[key] = done
                     break
-            # someone else is extracting this exact window — ride along, and if
+            # someone else is extracting this exact window: ride along, and if
             # their attempt failed report that rather than re-paying the fetch
             waiting.wait(timeout=180)
             with sess.subwin_lock:
@@ -591,7 +591,7 @@ class PrefetchWorker(threading.Thread):
         idle_wait = 2.0
         while not self._stop.is_set():
             if time.monotonic() - sess.last_access > self.IDLE_PAUSE:
-                # nobody is watching — idle until a request touches the session
+                # nobody is watching; idle until a request touches the session
                 # (notify() also wakes us immediately on the next segment hit)
                 self._wake.wait(timeout=5.0)
                 self._wake.clear()
@@ -632,7 +632,7 @@ class PrefetchWorker(threading.Thread):
                                 sess.init = _init
                     produced = True
                 else:
-                    # claim must never leak — on-demand waiters block on it
+                    # claim must never leak: on-demand waiters block on it
                     sess.cache.release(i)
                     if not self._stop.is_set():
                         errors = True
@@ -643,7 +643,7 @@ class PrefetchWorker(threading.Thread):
             if not produced:
                 if errors:
                     # upstream is failing (dead link, 429): back off instead of
-                    # re-hitting it every 2s — a seek/wake still resumes instantly
+                    # re-hitting it every 2s (a seek/wake still resumes instantly)
                     idle_wait = min(60.0, idle_wait * 2)
                 self._wake.wait(timeout=idle_wait)
                 self._wake.clear()

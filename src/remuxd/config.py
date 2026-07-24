@@ -2,7 +2,7 @@
 
 Every knob is overridable via an env var so the service can be configured
 without code changes (containers, systemd units, etc.). Nothing here holds a
-secret by default — credentials for optional plugins live in their own config.
+secret by default: credentials for optional plugins live in their own config.
 """
 import logging
 import os
@@ -56,10 +56,10 @@ class Config:
 
     session_ttl_seconds: int = 30 * 60  # reap after this much idle
     max_sessions: int = 32              # concurrency cap (0 = unlimited)
-    # Memoize the expensive per-source prep (resolved URL, probe, size, cues index,
-    # header bytes) so a repeat /start on the same src — e.g. an audio-track switch
-    # or replay — skips it. Short TTL because CDN links expire (fragments self-heal
-    # if one does). 0 disables the cache.
+    # Memoize the expensive per-source prep (resolved URL, probe, size, cues
+    # index, header bytes) so a repeat /start on the same src (an audio-track
+    # switch, a replay) skips it. Short TTL because CDN links expire (fragments
+    # self-heal if one does). 0 disables the cache.
     prep_cache_ttl: int = 120
 
     user_agent: str = DEFAULT_UA        # UA for upstream fetches

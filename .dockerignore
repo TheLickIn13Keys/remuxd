@@ -1,0 +1,34 @@
+# Secrets: .env holds real resolver credentials. Never let it into a layer.
+.env
+.env.*
+!.env.example
+
+# VCS and local tooling
+.git
+.gitignore
+.github
+.venv
+venv
+.ruff_cache
+.pytest_cache
+.claude
+
+# Build artifacts (the image builds its own wheel)
+build
+dist
+*.egg-info
+src/*.egg-info
+__pycache__
+**/__pycache__
+*.py[cod]
+
+# Runtime scratch: session working dirs, never part of an image
+.remuxd-sessions
+.remuxd-test-*
+
+# Docs and editor cruft
+Dockerfile
+.dockerignore
+*.md
+!README.md
+.DS_Store

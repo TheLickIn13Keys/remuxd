@@ -172,7 +172,7 @@ function applyAss(newAss){
   else renderAss(s.assText);
 }
 // End time of the last cue in a whole-file .ass. ffmpeg writes cues in order, so
-// the tail is enough — no full scan of a script that can reach megabytes.
+// the tail is enough: no full scan of a script that can reach megabytes.
 function lastCueEnd(ass){
   const tail=ass.length>8000?ass.slice(-8000):ass;
   const re=/^Dialogue:[^,]*,[^,]*,(\d+):(\d\d):(\d\d(?:\.\d+)?)/gm; let m, last=0;
@@ -181,7 +181,7 @@ function lastCueEnd(ass){
 }
 // Seconds of cues to keep ahead of the playhead. The server window runs to
 // ~t+45, so refilling at 25 leaves room for the fetch to land before the cues
-// on screen run out — otherwise subs stop dead partway through a seeked-to scene.
+// on screen run out; otherwise subs stop dead partway through a seeked-to scene.
 const SUB_AHEAD=25;
 let subwinBusy=false, subwinPending=null;
 async function subFill(t){
@@ -191,7 +191,7 @@ async function subFill(t){
   if(hasCueNear(s.assText, t)) return;
   // Behind the whole-file pass's write head there is nothing to recover: it has
   // already emitted this region (t just falls in a gap between lines). Fetching
-  // a window here would download tens of MB for nothing — notably at t≈0 on
+  // a window here would download tens of MB for nothing, notably at t≈0 on
   // first load, where the pass is about to deliver the cues anyway.
   if(t<=s.passFront+5) return;
   // One request per 30s region per track: a stretch with genuinely no dialogue
@@ -217,7 +217,7 @@ async function subFill(t){
 v.addEventListener('seeking', ()=>subFill(v.currentTime));
 v.addEventListener('seeked', ()=>subFill(v.currentTime));
 // Top up ahead of the playhead so subs don't die at the edge of a fetched
-// window. Throttled — hasCueNear scans the whole script, and timeupdate is ~4Hz.
+// window. Throttled: hasCueNear scans the whole script, and timeupdate is ~4Hz.
 let lastAhead=0;
 v.addEventListener('timeupdate',()=>{
   const now=Date.now(); if(now-lastAhead<2000) return; lastAhead=now;
@@ -266,7 +266,7 @@ function loadSubs(tracks){
     const fchange=await refreshFonts();
     if(fchange==='gone'){clearInterval(s.poll);return;}   // session gone -> stop polling
     // fonts landed after the renderer was built: feed the new ones to the live
-    // instance (worker fetches + reloads libass fonts) — without this,
+    // instance (worker fetches + reloads libass fonts); without this,
     // signs/typesetting silently render with the fallback font forever
     if(fchange===true && s.jassub){
       s.sentFonts=s.sentFonts||new Set();
@@ -287,7 +287,7 @@ function loadSubs(tracks){
     }
   };
   s.poll=setInterval(tick,3000);
-  tick();   // fire now, not in 3s — this also kicks the server's lazy extraction
+  tick();   // fire now, not in 3s; this also kicks the server's lazy extraction
 }
 function attach(src, direct){
   if(hls){hls.destroy();hls=null;}
@@ -345,7 +345,7 @@ async function playUrl(url, mode, headers, audioIdx, resumeAt){
     if(!r.ok) throw new Error(j.error||'failed');
     streamInfo=j;
     const pt = j.mode==='passthrough';
-    subBase = `${pt?'⚡ direct-play (no transcode) — ':''}`
+    subBase = `${pt?'⚡ direct-play (no transcode) &nbsp;·&nbsp; ':''}`
           +`video: <code>${j.video} ${j.pix_fmt}</code> → ${j.video_action} &nbsp;|&nbsp; `
           +`audio: <code>${j.audio}</code> → ${j.audio_action}`;
     status(subBase + (j.tracks&&j.tracks.length?' &nbsp;·&nbsp; loading subs…':''));
@@ -360,7 +360,7 @@ async function playUrl(url, mode, headers, audioIdx, resumeAt){
 }
 function loadAudios(audios){
   const sel=$('audsel');
-  if(!audios.length){ sel.innerHTML='<option>—</option>'; sel.disabled=true; $('subbar').style.display=''; return; }
+  if(!audios.length){ sel.innerHTML='<option>(none)</option>'; sel.disabled=true; $('subbar').style.display=''; return; }
   sel.disabled=false;
   sel.innerHTML=audios.map(a=>
     `<option value="${a.index}"${a.default?' selected':''}>${a.label}${a.lang?' ('+a.lang+')':''}</option>`).join('');
@@ -378,7 +378,7 @@ async function find(){
     const r=await fetch('/resolve?anilist='+encodeURIComponent(id));
     const j=await r.json();
     if(!r.ok) throw new Error(j.error||'failed');
-    status(`${j.results.length} streams for <code>${j.media_id}</code> — ranked; top plays best. Click any to play.`);
+    status(`${j.results.length} streams for <code>${j.media_id}</code>: ranked, top plays best. Click any to play.`);
     const ul=$('list'); ul.innerHTML='';
     j.results.forEach((s,i)=>{
       const d=s.decision||{};

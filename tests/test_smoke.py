@@ -84,7 +84,7 @@ def test_capacity_rejects_when_all_active(tmp_root="./.remuxd-test-cap"):
 
 
 def test_shutdown_preserves_foreign_root(tmp_root="./.remuxd-test-foreign"):
-    """shutdown() must only clean up its own session dirs — the root may be a
+    """shutdown() must only clean up its own session dirs: the root may be a
     pre-existing directory (REMUXD_SESSION_ROOT=/tmp must not be wiped)."""
     os.makedirs(tmp_root, exist_ok=True)
     keep = os.path.join(tmp_root, "keep.txt")
@@ -171,7 +171,7 @@ def test_server_endpoints_live():
 
 
 def test_resolver_is_not_self_bound():
-    """A resolver set on the Handler must be called with only the id — regression
+    """A resolver set on the Handler must be called with only the id. Regression
     for a bare function binding `self` as its first positional arg."""
     import threading
     from http.server import ThreadingHTTPServer
@@ -209,7 +209,7 @@ def test_fragment_cache_evicts_farthest():
 
 def test_fragment_cache_inflight_dedup():
     """A second claimer of an in-flight index must be told to wait (not produce),
-    and be released by put/release — this is what stops the double CDN fetch."""
+    and be released by put/release: this is what stops the double CDN fetch."""
     from remuxd.session import FragmentCache
     c = FragmentCache(budget_bytes=10_000)
     should, ev = c.claim(9)
@@ -433,7 +433,7 @@ def test_video_encode_validation():
 
 
 def test_stop_endpoint():
-    """POST /stop/<sid> must tear the session down immediately — abandoned
+    """POST /stop/<sid> must tear the session down immediately; abandoned
     sessions otherwise keep prefetching until the idle TTL. POST-only: it has
     side effects, and navigator.sendBeacon (tab close) sends POST."""
     import threading
@@ -476,7 +476,7 @@ def test_stop_endpoint():
 def test_fontlist_serves_only_fonts():
     """ffmpeg dumps ALL attachments (cover art included) under whatever names the
     MKV declares; /fontlist must expose exactly the real fonts (by magic bytes,
-    not extension — attachments are often extensionless or mislabeled), and
+    not extension, since attachments are often extensionless or mislabeled), and
     /fonts must send a sensible content-type."""
     import json as _json
     import threading
@@ -524,7 +524,7 @@ def test_fontlist_serves_only_fonts():
 
 def test_refresh_url_throttles_and_never_adopts_src():
     """_refresh_url must (a) rate-limit debrid-resolver lookups per session and
-    (b) never set sess.url to the src playback link when the resolver fails —
+    (b) never set sess.url to the src playback link when the resolver fails,
     that would route every fragment fetch through the resolver (429 storm)."""
     from remuxd import engine as eng_mod
     cfg = Config(session_root="./.remuxd-test-refresh")
@@ -623,7 +623,7 @@ def test_subwindow_caches_dedups_and_warms_ahead():
 
 def test_extract_window_streams_range_with_absolute_timestamps():
     """extract_window feeds the byte range into ffmpeg as it downloads (rather
-    than buffering it whole first) — it must still emit the window's cues with
+    than buffering it whole first): it must still emit the window's cues with
     -copyts absolute timings, not rebased to zero."""
     import shutil
     import subprocess as sp
@@ -719,7 +719,7 @@ def test_dump_args_sanitizes_attachment_names():
 
 def test_extract_all_retries_with_refreshed_url():
     """A failed extraction (expired CDN link, 403) must re-resolve the URL and
-    retry once — and must not fail silently."""
+    retry once, and must not fail silently."""
     import shutil as _shutil
     from remuxd import subtitles
 
@@ -774,7 +774,7 @@ def test_prefetch_pauses_when_idle():
 
 
 def test_serve_segment_releases_claim_on_error():
-    """A fragment() exception must release the in-flight claim — a leaked claim
+    """A fragment() exception must release the in-flight claim: a leaked claim
     makes every later request for that segment block for the full wait."""
     from remuxd.session import FragmentCache
     cfg = Config(session_root="./.remuxd-test-claim")
@@ -798,7 +798,7 @@ def test_serve_segment_releases_claim_on_error():
 
 def test_fragment_closes_response_when_ffmpeg_fails():
     """`resp` is only owned by the feeder thread once it starts; if spawning
-    ffmpeg fails before that, fragment() must still close it — otherwise the
+    ffmpeg fails before that, fragment() must still close it; otherwise the
     pooled upstream connection leaks on every attempt."""
     from remuxd import engine as engine_mod
 
@@ -1047,7 +1047,7 @@ def test_pooled_fetch_range():
 
 def test_head_is_readonly():
     """HEAD is routed through do_GET so the demo can poll Content-Length on
-    growing .ass files — it must not reach the endpoints with side effects."""
+    growing .ass files, but must not reach the endpoints with side effects."""
     import threading
     from http.server import ThreadingHTTPServer
     from remuxd.server import Handler
@@ -1084,7 +1084,7 @@ def test_head_is_readonly():
 
 def test_fonts_with_spaces_roundtrip():
     """System-font filenames contain spaces ("Trebuchet MS.ttf"): /fontlist must
-    percent-encode them and /fonts must decode — unencoded they 404 and the
+    percent-encode them and /fonts must decode; unencoded they 404 and the
     renderer silently falls back (regression). Traversal stays blocked encoded."""
     import threading
     from http.server import ThreadingHTTPServer
@@ -1145,20 +1145,31 @@ def test_ass_style_font_matching():
     assert subtitles.ass_fontnames(ass) == {"Trebuchet MS", "Custom Font", "Verdana"}
 
     fdir = tempfile.mkdtemp()
+    # Nested, the way Linux ships fonts (Debian: /usr/share/fonts/truetype/<pkg>/)
+    # and the way a mounted font dir usually looks. A flat listdir finds nothing
+    # here, which made the whole pass dead on any non-macOS host.
+    nested = os.path.join(fdir, "truetype", "customfont")
+    os.makedirs(nested)
     for fn in ("Custom Font.ttf", "Custom Font Bold.ttf", "CustomFontier.ttf",
                "Custom Font.txt", "Other.ttf"):
-        with open(os.path.join(fdir, fn), "wb") as f:
+        with open(os.path.join(nested, fn), "wb") as f:
             f.write(b"\x00\x01\x00\x00x")
+    with open(os.path.join(fdir, "Custom Font Italic.otf"), "wb") as f:
+        f.write(b"OTTOx")                      # flat file in the root still works
     orig = subtitles._SYSTEM_FONT_DIRS
     subtitles._SYSTEM_FONT_DIRS = [fdir, "/nonexistent"]
+    subtitles._font_index_cache.clear()
     try:
         hits = sorted(os.path.basename(p)
                       for p in subtitles._find_system_fonts("custom font"))
-        # exact + weight variants match; unrelated stems and non-fonts don't
-        assert hits == ["Custom Font Bold.ttf", "Custom Font.ttf"]
+        # exact + weight variants match, at any depth; unrelated stems and
+        # non-font extensions don't
+        assert hits == ["Custom Font Bold.ttf", "Custom Font Italic.otf",
+                        "Custom Font.ttf"]
         assert subtitles._find_system_fonts("nope") == []
     finally:
         subtitles._SYSTEM_FONT_DIRS = orig
+        subtitles._font_index_cache.clear()
 
 
 if __name__ == "__main__":

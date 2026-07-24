@@ -49,7 +49,7 @@ class FragmentCache:
     def claim(self, i: int):
         """-> (should_produce, event):
           (True, event)  caller should produce; event fires on put/release.
-          (False, event) someone else is producing — wait on event, then re-get.
+          (False, event) someone else is producing; wait on event, then re-get.
           (False, None)  already cached."""
         with self._lock:
             if i in self._data:
@@ -76,7 +76,7 @@ class FragmentCache:
                 self.bytes += len(data)
                 while self.bytes > self.budget and len(self._data) > 1:
                     # evict behind the playhead first (already watched), then the
-                    # farthest ahead — never the leading edge we just prefetched.
+                    # farthest ahead, never the leading edge we just prefetched.
                     far = max(self._data, key=lambda k: (k < playhead, abs(k - playhead)))
                     self.bytes -= len(self._data.pop(far))
         if ev is not None:
@@ -240,7 +240,7 @@ class SessionManager:
 
     def shutdown(self) -> None:
         """Stop the reaper and tear down every session. Only removes the root dir
-        if it's empty afterwards — the root may be a pre-existing directory the
+        if it's empty afterwards: the root may be a pre-existing directory the
         user pointed us at (REMUXD_SESSION_ROOT=/tmp would be catastrophic to
         rmtree)."""
         self._stop.set()
@@ -252,4 +252,4 @@ class SessionManager:
         try:
             os.rmdir(self.root)
         except OSError:
-            pass   # not empty / already gone — leave it alone
+            pass   # not empty / already gone; leave it alone

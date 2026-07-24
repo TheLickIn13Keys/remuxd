@@ -50,7 +50,7 @@ def dump_args(attachments: List[dict]) -> List[str]:
     """ffmpeg args to dump each attachment stream to an explicit, sanitized
     filename (relative to the ffmpeg cwd = the fonts dir). Explicit-per-stream
     rather than the blanket ``-dump_attachment:t ""``, which trusts the MKV's
-    declared filenames — a crafted ``../../name`` would escape the fonts dir."""
+    declared filenames; a crafted ``../../name`` would escape the fonts dir."""
     args: List[str] = []
     seen = set()
     for n, att in enumerate(attachments or []):
@@ -65,12 +65,14 @@ def dump_args(attachments: List[dict]) -> List[str]:
 
 # Where installed fonts live on the machine running remuxd (macOS + Linux).
 _SYSTEM_FONT_DIRS = [
-    "/System/Library/Fonts", "/System/Library/Fonts/Supplemental",
-    "/Library/Fonts", os.path.expanduser("~/Library/Fonts"),
+    "/System/Library/Fonts", "/Library/Fonts", os.path.expanduser("~/Library/Fonts"),
     "/usr/share/fonts", "/usr/local/share/fonts",
     os.path.expanduser("~/.local/share/fonts"), os.path.expanduser("~/.fonts"),
 ]
 _FONT_EXTS = (".ttf", ".otf", ".ttc")
+# Cap per root, so a huge mounted tree can't turn this into a full-disk walk.
+_MAX_FONT_SCAN = 20000
+_font_index_cache = {}
 
 
 def ass_fontnames(text: str) -> set:
@@ -88,38 +90,56 @@ def ass_fontnames(text: str) -> set:
     return names
 
 
+_FONT_VARIANTS = {"", "regular", "bold", "italic", "oblique", "bolditalic",
+                  "boldoblique", "bd", "bi", "it", "i", "b"}
+
+
+def _font_index() -> List[tuple]:
+    """[(normalized_stem, path)] for every installed font file, built once per
+    distinct _SYSTEM_FONT_DIRS. Walks recursively: macOS keeps fonts flat in
+    /System/Library/Fonts, but Linux nests them (Debian puts everything under
+    /usr/share/fonts/truetype/<package>/), so a flat listdir finds nothing
+    there. A mounted font directory is usually nested too."""
+    key = tuple(_SYSTEM_FONT_DIRS)
+    cached = _font_index_cache.get(key)
+    if cached is not None:
+        return cached
+    index = []
+    for d in _SYSTEM_FONT_DIRS:
+        seen = 0
+        # os.walk swallows errors on missing/unreadable dirs by default
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                stem, ext = os.path.splitext(fn)
+                if ext.lower() in _FONT_EXTS:
+                    index.append((re.sub(r"[\s_-]+", "", stem).lower(),
+                                  os.path.join(root, fn)))
+            seen += len(files)
+            if seen >= _MAX_FONT_SCAN:
+                log.debug("font scan of %s hit the %d-entry cap", d, _MAX_FONT_SCAN)
+                break
+    _font_index_cache[key] = index
+    return index
+
+
 def _find_system_fonts(family: str) -> List[str]:
     """Installed font files for a family, matched by filename ("Trebuchet MS"
     -> "Trebuchet MS.ttf" + its Bold/Italic siblings). Filename matching is a
     heuristic, but over-matching is harmless: libass picks fonts by their
     internal name table, so an extra file is just ignored."""
     want = re.sub(r"[\s_-]+", "", family).lower()
-    _VARIANTS = {"", "regular", "bold", "italic", "oblique", "bolditalic",
-                 "boldoblique", "bd", "bi", "it", "i", "b"}
-    hits = []
-    for d in _SYSTEM_FONT_DIRS:
-        try:
-            entries = os.listdir(d)
-        except OSError:
-            continue
-        for fn in entries:
-            stem, ext = os.path.splitext(fn)
-            if ext.lower() not in _FONT_EXTS:
-                continue
-            norm = re.sub(r"[\s_-]+", "", stem).lower()
-            if norm.startswith(want) and norm[len(want):] in _VARIANTS:
-                hits.append(os.path.join(d, fn))
-    return hits
+    return [path for norm, path in _font_index()
+            if norm.startswith(want) and norm[len(want):] in _FONT_VARIANTS]
 
 
 def _dump_style_fonts(url: str, fonts_dir: str,
                       headers: Optional[Dict[str, str]] = None) -> int:
     """Serve locally-installed fonts for the families the ASS styles reference.
     Many web sources (e.g. CR WEB-DLs) embed NO fonts and just name system
-    fonts like "Trebuchet MS" — native players resolve those from the OS, but
+    fonts like "Trebuchet MS". Native players resolve those from the OS, but
     the browser-side libass/WASM renderer only sees fonts we serve, so it
     silently falls back to its default. Reads the styles from the subtitle
-    tracks' CodecPrivate (in the MKV header — no full-file read)."""
+    tracks' CodecPrivate (in the MKV header, no full-file read)."""
     try:
         privates = mkvcues.fetch_subtitle_privates(url, headers)
     except Exception as e:
@@ -152,7 +172,7 @@ def extract_all(ffmpeg: str, url: str, tracks: List[dict], fonts_dir: str,
     """Extract all text tracks as .ass and dump embedded fonts in ONE pass (a single
     read of the file). Best-effort; meant to run in a background thread.
 
-    ``ua``: browser-like User-Agent for the HTTP fetch — ffmpeg's default Lavf UA
+    ``ua``: browser-like User-Agent for the HTTP fetch; ffmpeg's default Lavf UA
     gets 403'd by some CDNs (every other fetch in remuxd already sends this).
     ``refresh_url``: callable(failed_url) -> fresh URL; extraction runs long after
     /start, so an expired CDN link gets one re-resolve + retry.
@@ -161,7 +181,7 @@ def extract_all(ffmpeg: str, url: str, tracks: List[dict], fonts_dir: str,
         return
     os.makedirs(fonts_dir, exist_ok=True)
     # Styles may name fonts the release didn't embed but that exist on this
-    # machine — serve those too, so the browser renderer matches native players.
+    # machine; serve those too, so the browser renderer matches native players.
     try:
         _dump_style_fonts(url, fonts_dir, headers)
     except Exception as e:
@@ -200,7 +220,7 @@ def extract_window(ffmpeg: str, url: str, header_bytes: bytes, boff: int,
                    headers: Optional[Dict[str, str]] = None) -> bytes:
     """On-demand ASS for a byte window: stream clusters [boff,bend) into ffmpeg
     behind the MKV header and extract track_index with -copyts (preserve absolute
-    timestamps; without it ffmpeg rebases to 0). Byte-range only — no ffmpeg HTTP
+    timestamps; without it ffmpeg rebases to 0). Byte-range only, no ffmpeg HTTP
     seek.
 
     The range is piped in as it downloads rather than buffered whole first: these
@@ -224,7 +244,7 @@ def extract_window(ffmpeg: str, url: str, header_bytes: bytes, boff: int,
                     p.stdin.write(chunk)
         except Exception as e:
             # ffmpeg exiting early (it has all the subs it needs) closes the pipe
-            # under us — that's a normal finish, not a fetch failure
+            # under us; that's a normal finish, not a fetch failure
             log.debug("subwindow feed ended: %s", e)
         finally:
             try:

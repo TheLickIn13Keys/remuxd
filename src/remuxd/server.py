@@ -111,7 +111,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._root()
             # HEAD is routed through do_GET for the read-only endpoints (the demo
             # polls Content-Length on growing .ass files), but must not reach the
-            # ones with side effects — a HEAD /start would spin up a whole session.
+            # ones with side effects: a HEAD /start would spin up a whole session.
             if p in ("/start", "/resolve") and self.command == "HEAD":
                 return self._err(405, "method not allowed")
             if p == "/start":
@@ -138,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:   # never let a handler crash the connection loop
             log.exception("handler error for %s", self.path)
             if self._response_started:
-                # headers already out — a JSON error would land mid-body; just
+                # headers already out, so a JSON error would land mid-body; just
                 # drop the connection so the client sees a clean failure
                 self.close_connection = True
             else:
@@ -149,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_POST(self):
-        # /stop only — POST because it has side effects, and because
+        # /stop only. POST because it has side effects, and because
         # navigator.sendBeacon (the one request browsers deliver reliably from a
         # closing tab) sends POST.
         self._response_started = False
@@ -271,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             shutil.copyfileobj(up, self.wfile, length=256 * 1024)
         except (BrokenPipeError, ConnectionResetError):
-            pass   # client seeked/closed — normal during scrubbing
+            pass   # client seeked/closed; normal during scrubbing
         finally:
             up.close()
 
@@ -333,7 +333,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(404, "no subtitles")   # not extracted yet
         with open(path, "rb") as f:
             data = f.read()
-        # the file grows while extraction runs — clients must always re-poll
+        # the file grows while extraction runs, so clients must always re-poll
         return self._send_ranged(data, "text/plain; charset=utf-8", cache="no-store")
 
     def _subwindow(self, sid, qs):
@@ -370,13 +370,13 @@ class Handler(BaseHTTPRequestHandler):
         self.engine.ensure_sub_extraction(sess)   # fonts come from the same pass
         fdir = sess.fonts_dir()
         # ffmpeg dumps ALL attachments (cover art, chapter thumbs, ...) with
-        # whatever filenames the MKV declares — often extensionless. Sniff magic
+        # whatever filenames the MKV declares, often extensionless. Sniff magic
         # bytes: only real fonts go to the renderer (a JPEG breaks font loading),
         # and a font named "OpenSans" without .ttf still gets served.
         names = sorted(n for n in os.listdir(fdir)
                        if self._is_font_file(os.path.join(fdir, n))) \
             if os.path.isdir(fdir) else []
-        # quote: system-font filenames contain spaces ("Trebuchet MS.ttf") —
+        # quote: system-font filenames contain spaces ("Trebuchet MS.ttf");
         # unencoded they never round-trip through the browser's fetch
         return self._json(200, [f"/fonts/{sid}/{quote(n)}" for n in names])
 

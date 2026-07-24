@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mkvcues.py — get keyframe (time, byte-offset) pairs from an MKV/WebM Cues index
+mkvcues.py: get keyframe (time, byte-offset) pairs from an MKV/WebM Cues index
 using only small HTTP byte-range reads (no full download).
 
 Matroska stores a seek index (Cues) whose position is advertised in the
@@ -43,7 +43,7 @@ EBML_HEADER   = 0x1A45DFA3
 HEADER_PROBE = 64 * 1024
 MAX_CUES     = 4 * 1024 * 1024
 # An element this large inside the header region is malformed (or an EBML
-# "unknown size" marker, which decodes as a huge value) — can't be skipped over.
+# "unknown size" marker, which decodes as a huge value), so it can't be skipped over.
 _MAX_ELEMENT = 1 << 40
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120 Safari/537.36")
@@ -178,8 +178,8 @@ def _timestamp_scale(buf, seg_off):
 
 def _video_track_number(buf, seg_off):
     """TrackNumber of the first video track (TrackType 1), or None. Cues can
-    index several tracks — audio/subtitle cue positions point at clusters far
-    from the video keyframe — so windows must be built from the video track's
+    index several tracks, and audio/subtitle cue positions point at clusters
+    far from the video keyframe, so windows must be built from the video track's
     positions only."""
     pos = seg_off
     end = len(buf)
@@ -222,7 +222,7 @@ def _video_track_number(buf, seg_off):
 def strip_attachments(header: bytes, seg_off: int) -> bytes:
     """Remove Attachments elements from a header blob (bytes [0, first cluster)).
     Embedded fonts can be tens of MB, and the header is prepended to every fragment
-    piped to ffmpeg — the A/V remux never needs them (fonts are served to the
+    piped to ffmpeg, and the A/V remux never needs them (fonts are served to the
     client out-of-band). SeekHead offsets go stale, but ffmpeg ignores them on
     non-seekable (piped) input. Returns the header unchanged if anything looks off."""
     spans = []
@@ -291,7 +291,7 @@ def _fetch_toplevel(url, header, seg_off, target_id, headers=None):
 
 def fetch_subtitle_privates(url, headers=None):
     """CodecPrivate blobs of the subtitle tracks (TrackType 17), via ranged
-    reads. For S_TEXT/ASS tracks the blob is the ASS script header — including
+    reads. For S_TEXT/ASS tracks the blob is the ASS script header, including
     [V4+ Styles] with the font names each style renders with."""
     header = _get_range(url, 0, HEADER_PROBE, headers)
     seg_off = parse_ebml_header(header)
@@ -335,7 +335,7 @@ def build_cue_points(cues_buf, scale_ns, seg_off, video_track=None):
     Byte offsets in CueClusterPosition are relative to Segment data, so we add
     seg_off to get absolute file positions.
 
-    ``video_track``: prefer that track's CueTrackPositions — a CuePoint can index
+    ``video_track``: prefer that track's CueTrackPositions. A CuePoint can index
     several tracks, and audio/subtitle positions point at clusters far from the
     video keyframe (using them yields inverted/overlapping byte windows). The
     final monotonic filter guards against any that still slip through."""
@@ -358,7 +358,7 @@ def build_cue_points(cues_buf, scale_ns, seg_off, video_track=None):
                 points.append((t * scale_ns / 1e9, seg_off + off))
         pos = p + size
     points.sort()
-    # keep only strictly increasing (time, offset) — a backward offset would
+    # keep only strictly increasing (time, offset); a backward offset would
     # produce an inverted byte range that ffmpeg can't parse
     clean = []
     for t, off in points:
@@ -410,8 +410,8 @@ def fetch_range(url, start, end, headers=None):
 
 
 def open_range(url, start, end, headers=None):
-    """Same range as fetch_range but as an open, incrementally readable response —
-    lets a consumer start work on the first bytes instead of waiting for the whole
+    """Same range as fetch_range but as an open, incrementally readable response.
+    Lets a consumer start work on the first bytes instead of waiting for the whole
     range to land. Caller must close it (it is a context manager)."""
     return netio.open_url(url, UA, headers, rng=(start, end), timeout=60)
 

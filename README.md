@@ -4,7 +4,7 @@ On-demand remux/transcode of arbitrary video URLs to seekable **HLS**.
 
 Point it at any `http(s)` MKV/MP4/WebM and it probes the source, decides whether
 the browser can **stream-copy** the codecs (fast, lossless) or must **transcode**,
-then serves a seekable HLS stream — plus extracted text subtitles and embedded
+then serves a seekable HLS stream, plus extracted text subtitles and embedded
 fonts. It's a small, dependency-free HTTP service (stdlib only; needs `ffmpeg`
 and `ffprobe` on `PATH`).
 
@@ -15,8 +15,8 @@ For each source, `remuxd` picks one of three strategies:
 | Strategy | When | What it does |
 |----------|------|--------------|
 | **passthrough** | already browser-native (MP4 / 8-bit H.264 / AAC) | proxies the bytes, no ffmpeg |
-| **seek-copy** | browser-decodable codec + an MKV Cues index | synthesizes a VOD playlist and produces each keyframe-aligned fMP4 fragment on demand from HTTP byte-range reads — lossless, instant seeking |
-| **seek-transcode** | must transcode (Hi10, HDR, undecodable codec, or forced) + an MKV Cues index | same on-demand VOD machinery, but re-encodes each window to 8-bit H.264 — full random-access seeking on transcoded output |
+| **seek-copy** | browser-decodable codec + an MKV Cues index | synthesizes a VOD playlist and produces each keyframe-aligned fMP4 fragment on demand from HTTP byte-range reads: lossless, instant seeking |
+| **seek-transcode** | must transcode (Hi10, HDR, undecodable codec, or forced) + an MKV Cues index | same on-demand VOD machinery, but re-encodes each window to 8-bit H.264, giving full random-access seeking on transcoded output |
 | **singlepass** | must transcode/copy but no usable index | one long-running ffmpeg producing live MPEG-TS HLS (seekable once it finishes) |
 
 10-bit H.264 (Hi10) is the one AVC case no browser can decode, so it's transcoded;
@@ -41,9 +41,39 @@ remuxd --session-root /var/tmp/remuxd --log-level DEBUG
 
 Every flag has an env-var equivalent (below); flags win.
 
+### Docker
+
+```sh
+docker build -t remuxd .
+docker run --rm -p 127.0.0.1:8000:8000 remuxd
+docker run --rm -p 127.0.0.1:8000:8000 --env-file .env -e REMUXD_DEMO=1 remuxd
+```
+
+The image bundles `ffmpeg`/`ffprobe`, runs unprivileged, and defaults
+`REMUXD_HOST` to `0.0.0.0` (the `127.0.0.1` default would be unreachable from
+outside the container). Session scratch lives in `/var/lib/remuxd/sessions`; add
+`--tmpfs /var/lib/remuxd/sessions` to keep it off disk. `docker stop` is a clean
+shutdown: remuxd runs as PID 1 and reaps sessions on `SIGTERM`.
+
+**Fonts.** Releases that embed no fonts and just name system ones (see
+[Subtitle fonts](#subtitle-fonts)) need those fonts present in the container,
+which ships with only a minimal set. `/usr/share/fonts` is scanned recursively,
+so mount yours into a *subdirectory* of it; that keeps the image's own fonts
+visible rather than hiding them behind the mount:
+
+```sh
+docker run --rm -p 127.0.0.1:8000:8000 \
+  -v /usr/share/fonts:/usr/share/fonts/host:ro \
+  remuxd
+```
+
+On macOS use `~/Library/Fonts` (or any folder you control) as the source;
+`/System/Library/Fonts` is on the read-only system volume and Docker Desktop
+can't share it.
+
 ## Use it as a backend
 
-The engine is a plain HTTP API — any HLS client (hls.js, Safari `<video>`, an
+The engine is a plain HTTP API: any HLS client (hls.js, Safari `<video>`, an
 iOS/tvOS player, your own frontend) can drive it. All URLs are scoped to the
 session id returned by `/start`, so many clients stream concurrently.
 
@@ -66,7 +96,7 @@ curl 'http://127.0.0.1:8000/start?src=<url-encoded-mkv-url>&mode=remux'
 }
 ```
 
-Abridged — the response also carries `pix_fmt`, `container` and `audio_action`.
+Abridged; the response also carries `pix_fmt`, `container` and `audio_action`.
 `subs`, `fontlist` and `subwindow` are `null` when the source has no text
 subtitles (and `subwindow` also on the non-seek paths), so check before using.
 
@@ -90,8 +120,28 @@ subtitles (and `subwindow` also on the non-seek paths), so check before using.
 - `/start` answers **502** if the source can't be probed or opened, and **503**
   when `REMUXD_MAX_SESSIONS` is reached with every session still active.
 
-Subtitles come back as standard ASS — render them however you like (the demo
+Subtitles come back as standard ASS, so render them however you like (the demo
 uses JASSUB, but that's just the demo's choice).
+
+### Subtitle fonts
+
+`/fontlist/<sid>` returns every font a client needs to render the ASS correctly.
+It has two sources:
+
+1. **Fonts embedded in the MKV** (attachments), extracted alongside the
+   subtitles. This covers most fansubbed releases.
+2. **Fonts installed on the remuxd host.** Many web sources embed nothing and
+   just name a system font (`Trebuchet MS`, `Verdana`). A native player resolves
+   those from the OS, but a browser-side libass/WASM renderer only sees what we
+   serve it, so remuxd looks them up in the usual font directories and serves
+   any it finds.
+
+Source 2 makes rendering depend on the host: the same release looks different on
+a machine with the font installed than on one without. Matching is by **filename**,
+so metric-compatible substitutes don't count: a style naming `Arial` will not
+resolve against `LiberationSans-Regular.ttf`. Install the actual families you
+care about, or accept the renderer's fallback. Under Docker this means mounting
+a font directory (see [Docker](#docker)).
 
 ## Configuration (env)
 
@@ -106,10 +156,10 @@ uses JASSUB, but that's just the demo's choice).
 | `REMUXD_FRAGMENT_CACHE_MB` | `512` | per-session cap on cached fragment bytes (bounds memory at high read-ahead; farthest-from-playhead fragments evicted first) |
 | `REMUXD_PREFETCH_CONCURRENCY` | `6` | global cap on concurrent prefetch ffmpeg jobs (on-demand requests are never throttled) |
 | `REMUXD_SESSION_TTL` | `1800` | idle seconds before a session is reaped |
-| `REMUXD_PREP_CACHE_TTL` | `120` | seconds to memoize per-source prep (resolved URL, probe, cues index, header) so a repeat `/start` — audio switch, replay — skips it; `0` disables |
+| `REMUXD_PREP_CACHE_TTL` | `120` | seconds to memoize per-source prep (resolved URL, probe, cues index, header) so a repeat `/start` (audio switch, replay) skips it; `0` disables |
 | `REMUXD_MAX_SESSIONS` | `32` | concurrency cap (0 = unlimited). At the cap, sessions idle >60 s are evicted LRU-first; if every session is active, `/start` answers **503** instead of killing a live stream |
 | `REMUXD_USER_AGENT` | Chrome UA | UA for upstream fetches |
-| `REMUXD_CORS_ORIGIN` | *(unset)* | if set (e.g. `https://player.example.com` or `*`), all responses carry `Access-Control-Allow-Origin` and `OPTIONS` preflights are answered — needed when a frontend on another origin drives the API |
+| `REMUXD_CORS_ORIGIN` | *(unset)* | if set (e.g. `https://player.example.com` or `*`), all responses carry `Access-Control-Allow-Origin` and `OPTIONS` preflights are answered; needed when a frontend on another origin drives the API |
 | `REMUXD_DEMO` | *(unset)* | `1`/`true`/`yes` serves the browser demo player at `/` (same as `--demo`) |
 | `REMUXD_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
@@ -130,7 +180,7 @@ runs ffmpeg faster-than-realtime, so it's inherently buffered ahead.)
 
 ## Tuning for your server
 
-Rough guidance — scale to your box:
+Rough starting points; scale to your box:
 
 - **Encoder**: default `libx264` uses the CPU and works anywhere. On a machine with
   Intel Quick Sync (most modern Intel iGPUs) or an NVIDIA GPU, set
@@ -171,13 +221,13 @@ so it's worth ending them deliberately:
 - Sessions are also reaped on idle and on shutdown, and their working dirs
   removed. The session **root** is only removed if empty, so pointing
   `REMUXD_SESSION_ROOT` at an existing directory is safe.
-- Full-file subtitle/font extraction is lazy — it starts on the first `/subs` or
+- Full-file subtitle/font extraction is lazy: it starts on the first `/subs` or
   `/fontlist` hit, so clients that never ask for subs don't trigger a whole-file
   read. `/subwindow` works independently of it.
 
 ## Notes
 
-- Single-file, stdlib-only server (`http.server`) — no framework, no runtime deps.
+- Single-file, stdlib-only server (`http.server`): no framework, no runtime deps.
 - `src` must be an `http(s)` URL; other schemes are rejected (`file://` would be a
   local-file read). Pass it URL-encoded **once**.
 - Segments, `init.mp4` and seekable playlists are served immutable; growing
