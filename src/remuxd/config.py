@@ -32,7 +32,7 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 8000
 
-    # override ffmpeg to point at a libass-enabled build, etc.
+    # override to pin a specific build (hardware encoders, etc.)
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
 

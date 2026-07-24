@@ -27,7 +27,7 @@ immediately; **singlepass** is the fallback when the source has no keyframe inde
 
 ```sh
 pip install -e .            # from this directory
-# ffmpeg + ffprobe must be on PATH (a libass-enabled build is needed for hardsub)
+# ffmpeg + ffprobe must be on PATH
 ```
 
 ## Run
@@ -36,7 +36,10 @@ pip install -e .            # from this directory
 remuxd                      # headless API on http://127.0.0.1:8000
 remuxd --demo               # also serve the browser test player at /
 remuxd --host 0.0.0.0 -p 9000
+remuxd --session-root /var/tmp/remuxd --log-level DEBUG
 ```
+
+Every flag has an env-var equivalent (below); flags win.
 
 ## Use it as a backend
 
@@ -63,6 +66,10 @@ curl 'http://127.0.0.1:8000/start?src=<url-encoded-mkv-url>&mode=remux'
 }
 ```
 
+Abridged — the response also carries `pix_fmt`, `container` and `audio_action`.
+`subs`, `fontlist` and `subwindow` are `null` when the source has no text
+subtitles (and `subwindow` also on the non-seek paths), so check before using.
+
 ### Endpoints
 
 | Endpoint | Purpose |
@@ -77,8 +84,11 @@ curl 'http://127.0.0.1:8000/start?src=<url-encoded-mkv-url>&mode=remux'
 | `POST /stop/<sid>` | tear the session down now (kills prefetch/ffmpeg, frees the cache) |
 
 - `mode`: `remux` (copy, default) · `auto` · `transcode`
-- `headers`: URL-encoded JSON of upstream request headers (auth, etc.)
+- `headers`: JSON object of upstream request headers (auth, etc.), URL-encoded
+  as a query value
 - `audio`: absolute audio stream index to select
+- `/start` answers **502** if the source can't be probed or opened, and **503**
+  when `REMUXD_MAX_SESSIONS` is reached with every session still active.
 
 Subtitles come back as standard ASS — render them however you like (the demo
 uses JASSUB, but that's just the demo's choice).
@@ -100,6 +110,7 @@ uses JASSUB, but that's just the demo's choice).
 | `REMUXD_MAX_SESSIONS` | `32` | concurrency cap (0 = unlimited). At the cap, sessions idle >60 s are evicted LRU-first; if every session is active, `/start` answers **503** instead of killing a live stream |
 | `REMUXD_USER_AGENT` | Chrome UA | UA for upstream fetches |
 | `REMUXD_CORS_ORIGIN` | *(unset)* | if set (e.g. `https://player.example.com` or `*`), all responses carry `Access-Control-Allow-Origin` and `OPTIONS` preflights are answered — needed when a frontend on another origin drives the API |
+| `REMUXD_DEMO` | *(unset)* | `1`/`true`/`yes` serves the browser demo player at `/` (same as `--demo`) |
 | `REMUXD_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
 ## Read-ahead / pre-buffering
@@ -148,25 +159,31 @@ export AIO_PASS=...
 Results are memoized for `AIO_CACHE_TTL` seconds (default 300; `0` disables), so
 re-opening or re-picking a title skips the slow debrid search.
 
+## Session lifecycle
+
+A session holds a fragment cache, a read-ahead worker and possibly a live ffmpeg,
+so it's worth ending them deliberately:
+
+- `POST /stop/<sid>` when the user switches away from a stream. Otherwise it
+  lingers until `REMUXD_SESSION_TTL`. As a safety net the read-ahead worker
+  pauses after 60 s with no client request, so an abandoned session stops
+  downloading even if `/stop` is never called.
+- Sessions are also reaped on idle and on shutdown, and their working dirs
+  removed. The session **root** is only removed if empty, so pointing
+  `REMUXD_SESSION_ROOT` at an existing directory is safe.
+- Full-file subtitle/font extraction is lazy — it starts on the first `/subs` or
+  `/fontlist` hit, so clients that never ask for subs don't trigger a whole-file
+  read. `/subwindow` works independently of it.
+
 ## Notes
 
 - Single-file, stdlib-only server (`http.server`) — no framework, no runtime deps.
-- `src` must be an `http(s)` URL (other schemes are rejected — `file://` etc. would
-  be a local-file-read / SSRF hole). Pass it URL-encoded **once**.
-- Upstream fetches use pooled keep-alive connections (one TLS handshake per host,
-  not per segment); fragment bytes stream straight into ffmpeg while downloading.
-- Full-file subtitle/font extraction is lazy: it starts on the first `/subs` or
-  `/fontlist` hit, so clients that never ask for subs don't trigger a whole-file
-  download. `/subwindow` works independently of it.
-- `POST /stop/<sid>` when the user switches away from a stream — otherwise it
-  lingers until the idle TTL. As a safety net, a session's read-ahead worker
-  pauses after 60 s without a client request, so an abandoned session stops
-  downloading even if `/stop` is never called.
-- Sessions are reaped on idle and on shutdown; working dirs are cleaned up. The
-  session root itself is only removed if empty (pointing `REMUXD_SESSION_ROOT` at
-  an existing directory is safe).
-- Segments, `init.mp4`, and seekable playlists are served with immutable
-  `Cache-Control`; growing resources (live playlists, subs being extracted) are
-  `no-store`. `HEAD` is supported on the read-only endpoints.
-- For public exposure, front it with a reverse proxy (TLS, auth, rate limiting)
-  and pin `REMUXD_MAX_SESSIONS` to your ffmpeg/CPU budget.
+- `src` must be an `http(s)` URL; other schemes are rejected (`file://` would be a
+  local-file read). Pass it URL-encoded **once**.
+- Segments, `init.mp4` and seekable playlists are served immutable; growing
+  resources (live playlists, subs mid-extraction) are `no-store`. `HEAD` works on
+  the read-only endpoints.
+- **remuxd fetches whatever URL it is given.** It has no authentication of its
+  own, so anything that can reach it can make it issue requests from your
+  network. Bind to localhost, or front it with a reverse proxy (TLS, auth, rate
+  limiting) and pin `REMUXD_MAX_SESSIONS` to your ffmpeg/CPU budget.
