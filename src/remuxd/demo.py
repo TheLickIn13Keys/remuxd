@@ -112,10 +112,16 @@ function renderAss(text){
       wasmUrl:'/static/jassub-worker.wasm',
       onDemandRender:false,
       availableFonts:{'liberation sans':'/static/default.woff2'},
-      fallbackFont:'liberation sans'
+      fallbackFont:'liberation sans',
+      // resolve non-embedded families (Trebuchet MS, Arial, ...) from the OS
+      // via the Local Font Access API where the browser supports it, instead
+      // of silently falling back for fonts the release never embedded
+      useLocalFonts:true
     });
+    s.sentFonts=new Set(s.fonts);   // fonts baked in at construction
     j.addEventListener('ready',()=>{ try{j.resize();}catch(e){}
-      status(subBase+' &nbsp;·&nbsp; <span style="color:#5bd67d">subs ✓ rendering</span>'); });
+      status(subBase+' &nbsp;·&nbsp; <span style="color:#5bd67d">subs ✓ rendering</span>'
+        +' ('+s.fonts.length+' embedded font'+(s.fonts.length===1?'':'s')+')'); });
     j.addEventListener('error',e=>{
       const m=(e&&e.error&&e.error.message)||e.message||'unknown';
       status(subBase+' &nbsp;·&nbsp; <span style="color:#e06">subs worker error: '+m+'</span>');
@@ -131,10 +137,14 @@ async function showTrack(idx){
   const s=subState; if(!s) return;
   s.cur=idx;
   if(s.jassub){ try{s.jassub.destroy();}catch(e){} s.jassub=null; }
-  s.assText='';
+  s.assText=''; s.passFront=0;
   if(idx<0) return;                                   // "Off"
   const text=await fetchAss(s.tracks[idx].url);
-  if(text){ s.assText=text; renderAss(text); }        // else the poll retries
+  if(text){ s.passFront=lastCueEnd(text); applyAss(text); }   // else poll retries
+  // The background extraction walks the file from the start, so a track picked
+  // mid-playback has no cues at the playhead for as long as that pass takes to
+  // get there. Pull the current window on demand instead of waiting for it.
+  subFill(v.currentTime);
 }
 function hasCueNear(ass, t){
   const re=/^Dialogue:[^,]*,(\d+):(\d\d):(\d\d(?:\.\d+)?),(\d+):(\d\d):(\d\d(?:\.\d+)?)/gm; let m;
@@ -145,8 +155,12 @@ function hasCueNear(ass, t){
   }
   return false;
 }
-function mergeCues(newAss){
-  const s=subState; if(!s||!s.assText) return;
+// Fold newly-arrived cues into what's on screen. With nothing rendered yet this
+// adopts them wholesale, so an on-demand window can be the first thing a track
+// shows rather than waiting for the whole-file pass to reach the playhead.
+function applyAss(newAss){
+  const s=subState; if(!s) return;
+  if(!s.assText){ s.assText=newAss; renderAss(newAss); return; }
   const NL=String.fromCharCode(10);
   const have=new Set(s.assText.split(NL).filter(l=>l.startsWith('Dialogue:')));
   const add=newAss.split(NL).filter(l=>l.startsWith('Dialogue:')&&!have.has(l));
@@ -155,25 +169,65 @@ function mergeCues(newAss){
   let base=s.assText; while(base.endsWith(NL)||base.endsWith(CR)) base=base.slice(0,-1);
   s.assText=base+NL+add.join(NL)+NL;
   if(s.jassub){ try{s.jassub.setTrack(s.assText);}catch(e){renderAss(s.assText);} }
+  else renderAss(s.assText);
 }
-let subwinBusy=false;
-async function subSeekFill(){
-  const s=subState; if(!s||s.cur<0||subwinBusy) return;
+// End time of the last cue in a whole-file .ass. ffmpeg writes cues in order, so
+// the tail is enough — no full scan of a script that can reach megabytes.
+function lastCueEnd(ass){
+  const tail=ass.length>8000?ass.slice(-8000):ass;
+  const re=/^Dialogue:[^,]*,[^,]*,(\d+):(\d\d):(\d\d(?:\.\d+)?)/gm; let m, last=0;
+  while((m=re.exec(tail))) last=Math.max(last,(+m[1])*3600+(+m[2])*60+parseFloat(m[3]));
+  return last;
+}
+// Seconds of cues to keep ahead of the playhead. The server window runs to
+// ~t+45, so refilling at 25 leaves room for the fetch to land before the cues
+// on screen run out — otherwise subs stop dead partway through a seeked-to scene.
+const SUB_AHEAD=25;
+let subwinBusy=false, subwinPending=null;
+async function subFill(t){
+  const s=subState; if(!s||s.cur<0) return;
   if(!streamInfo||!streamInfo.subwindow) return;      // only seek-copy sessions
-  const t=v.currentTime;
+  if(t<0) t=0;
   if(hasCueNear(s.assText, t)) return;
+  // Behind the whole-file pass's write head there is nothing to recover: it has
+  // already emitted this region (t just falls in a gap between lines). Fetching
+  // a window here would download tens of MB for nothing — notably at t≈0 on
+  // first load, where the pass is about to deliver the cues anyway.
+  if(t<=s.passFront+5) return;
+  // One request per 30s region per track: a stretch with genuinely no dialogue
+  // returns nothing to merge, and without this it would be re-fetched forever.
+  const bucket=s.cur+':'+Math.floor(t/30);
+  if(s.asked.has(bucket)) return;
+  if(subwinBusy){ subwinPending=t; return; }          // coalesce; run it after
+  s.asked.add(bucket);
   subwinBusy=true;
   try{
     const r=await fetch(streamInfo.subwindow+'?n='+s.cur+'&t='+Math.floor(t),{cache:'no-store'});
-    if(r.ok){ const txt=await r.text(); if(txt.indexOf('Dialogue:')>=0) mergeCues(txt); }
-  }catch(e){}
-  finally{ subwinBusy=false; }
+    if(r.ok){ const txt=await r.text(); if(txt.indexOf('Dialogue:')>=0) applyAss(txt); }
+    else s.asked.delete(bucket);                      // server-side miss -> retryable
+  }catch(e){ s.asked.delete(bucket); }
+  finally{
+    subwinBusy=false;
+    const p=subwinPending; subwinPending=null;
+    if(p!==null) subFill(p);
+  }
 }
-v.addEventListener('seeked', subSeekFill);
+// Fire on 'seeking' too: the window fetch is the long pole, so start it while
+// the video pipeline is still catching up rather than after it has.
+v.addEventListener('seeking', ()=>subFill(v.currentTime));
+v.addEventListener('seeked', ()=>subFill(v.currentTime));
+// Top up ahead of the playhead so subs don't die at the edge of a fetched
+// window. Throttled — hasCueNear scans the whole script, and timeupdate is ~4Hz.
+let lastAhead=0;
+v.addEventListener('timeupdate',()=>{
+  const now=Date.now(); if(now-lastAhead<2000) return; lastAhead=now;
+  subFill(v.currentTime+SUB_AHEAD);
+});
 function loadSubs(tracks){
   clearSubs();
   const sel=$('subsel');
-  const s={tracks, jassub:null, cur:-1, seen:tracks.map(()=>0), fonts:[], poll:null};
+  const s={tracks, jassub:null, cur:-1, seen:tracks.map(()=>0), fonts:[], poll:null,
+           assText:'', asked:new Set(), passFront:0};
   subState=s;
   sel.innerHTML='<option value="-1">Off</option>'+
     tracks.map((t,i)=>`<option value="${i}">${t.label}${t.lang?' ('+t.lang+')':''}</option>`).join('');
@@ -191,27 +245,49 @@ function loadSubs(tracks){
       return cr&&cr.includes('/') ? parseInt(cr.split('/')[1]) : (h.ok?0:-1);
     }catch(e){ return -1; }
   };
-  let ticks=0, started=false;
-  s.poll=setInterval(async()=>{
+  let ticks=0;
+  // -> 'gone' (session dead), true (list grew), false (no change). The list can
+  // grow across polls while ffmpeg is still dumping attachments, so keep
+  // refreshing instead of freezing the first non-empty snapshot.
+  const refreshFonts=async()=>{
+    if(!(streamInfo&&streamInfo.fontlist)) return false;
+    try{
+      const fr=await fetch(streamInfo.fontlist,{cache:'no-store'});
+      if(fr.status===404) return 'gone';
+      if(!fr.ok) return false;
+      const list=await fr.json();
+      if(list.length>s.fonts.length){ s.fonts=list; return true; }
+    }catch(e){}
+    return false;
+  };
+  const tick=async()=>{
     ticks++;
     if(ticks>1200){clearInterval(s.poll);return;}
-    if(streamInfo&&streamInfo.fontlist){
-      try{
-        const fr=await fetch(streamInfo.fontlist,{cache:'no-store'});
-        if(fr.status===404){clearInterval(s.poll);return;}   // session gone -> stop polling
-        if(fr.ok&&!s.fonts.length) s.fonts=await fr.json();
-      }catch(e){}
+    const fchange=await refreshFonts();
+    if(fchange==='gone'){clearInterval(s.poll);return;}   // session gone -> stop polling
+    // fonts landed after the renderer was built: feed the new ones to the live
+    // instance (worker fetches + reloads libass fonts) — without this,
+    // signs/typesetting silently render with the fallback font forever
+    if(fchange===true && s.jassub){
+      s.sentFonts=s.sentFonts||new Set();
+      for(const u of s.fonts) if(!s.sentFonts.has(u)){
+        try{s.jassub.addFont(u);}catch(e){}
+        s.sentFonts.add(u);
+      }
     }
-    const idx=s.cur>=0?s.cur:start;
-    const L=await len(tracks[idx].url);
+    if(s.cur<0 && ticks===1){ await showTrack(start); return; }   // "Off" is a choice
+    if(s.cur<0) return;
+    const L=await len(tracks[s.cur].url);
     if(L<0) return;
-    if(!started){ await showTrack(start); if(s.jassub) started=true; return; }
-    if(s.cur>=0 && L>s.seen[s.cur]){
-      s.seen[s.cur]=L;
+    if(!s.jassub){ await showTrack(s.cur); return; }   // retry until it renders
+    if(L>s.seen[s.cur]){
       const text=await fetchAss(tracks[s.cur].url);
-      if(text) mergeCues(text);
+      // only bank a length we actually read back
+      if(text){ s.seen[s.cur]=L; s.passFront=lastCueEnd(text); applyAss(text); }
     }
-  },3000);
+  };
+  s.poll=setInterval(tick,3000);
+  tick();   // fire now, not in 3s — this also kicks the server's lazy extraction
 }
 function attach(src, direct){
   if(hls){hls.destroy();hls=null;}
@@ -243,10 +319,22 @@ function attach(src, direct){
   }
 }
 let playCtx=null;
+// Tear the old session down NOW (kills its prefetch/ffmpeg) instead of leaving
+// it downloading until the idle TTL reaps it.
+function stopCurrent(){
+  if(hls){hls.destroy();hls=null;}   // stop segment requests to the dying sid
+  if(streamInfo&&streamInfo.sid){
+    fetch('/stop/'+streamInfo.sid,{method:'POST'}).catch(()=>{});
+    streamInfo=null;
+  }
+}
+addEventListener('pagehide',()=>{   // fires on tab close/navigate; beacon survives it
+  if(streamInfo&&streamInfo.sid) navigator.sendBeacon('/stop/'+streamInfo.sid);
+});
 async function playUrl(url, mode, headers, audioIdx, resumeAt){
   mode = mode || $('mode').value;
   playCtx={url, mode, headers};
-  $('go').disabled=true; clearSubs();
+  $('go').disabled=true; clearSubs(); stopCurrent();
   status(mode==='transcode' ? 'transcoding…' : 'probing…');
   try{
     let q='/start?mode='+mode+'&src='+encodeURIComponent(url);

@@ -19,17 +19,26 @@ _RECONNECT = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_m
 DEFAULT_VENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"]
 
 
-def probe(ffprobe: str, url: str, headers: Optional[Dict[str, str]] = None) -> Tuple:
+def probe(ffprobe: str, url: str, headers: Optional[Dict[str, str]] = None,
+          ua: Optional[str] = None) -> Tuple:
     """One ffprobe call -> (vcodec, pix_fmt, acodec, container, subs, aidx, audios,
-    duration). subs = TEXT subtitle streams (image subs skipped); audios = all audio
-    streams; aidx/acodec = the default chosen audio track (see choose_audio)."""
+    duration, attachments). subs = TEXT subtitle streams (image subs skipped);
+    audios = all audio streams; aidx/acodec = the default chosen audio track (see
+    choose_audio); attachments = embedded files (fonts) with their declared names."""
     h = header_args(headers)
+    if ua:
+        h = ["-user_agent", ua, *h]   # some CDNs 403 the default Lavf UA
     r = subprocess.run(
         [ffprobe, "-v", "error", *h, *_RECONNECT,
          "-show_entries",
-         "stream=index,codec_type,codec_name,pix_fmt:stream_tags=language,title:format=format_name,duration",
+         "stream=index,codec_type,codec_name,pix_fmt:stream_tags=language,title,filename:format=format_name,duration",
          "-of", "json", url],
         capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        # Surface the real error (dead link, 403, bad file) now, instead of an
+        # empty probe routing to singlepass and failing 30s later.
+        tail = (r.stderr or "").strip()[-500:]
+        raise RuntimeError(f"ffprobe failed (exit {r.returncode}): {tail}")
     try:
         data = json.loads(r.stdout or "{}")
     except json.JSONDecodeError:
@@ -37,6 +46,7 @@ def probe(ffprobe: str, url: str, headers: Optional[Dict[str, str]] = None) -> T
     vcodec = pixfmt = ""
     subs: List[dict] = []
     audios: List[dict] = []
+    attachments: List[dict] = []
     for st in data.get("streams", []):
         t = st.get("codec_type")
         tags = st.get("tags") or {}
@@ -51,6 +61,9 @@ def probe(ffprobe: str, url: str, headers: Optional[Dict[str, str]] = None) -> T
         elif t == "subtitle" and st.get("codec_name") in TEXT_SUBS:
             subs.append({"index": st.get("index"), "lang": lang,
                          "title": tags.get("title") or ""})
+        elif t == "attachment":
+            attachments.append({"index": st.get("index"),
+                                "filename": tags.get("filename") or ""})
     chosen = choose_audio(audios)
     acodec = chosen["codec"] if chosen else ""
     aidx = chosen["index"] if chosen else None
@@ -60,7 +73,7 @@ def probe(ffprobe: str, url: str, headers: Optional[Dict[str, str]] = None) -> T
         duration = float(fmt.get("duration") or 0)
     except (TypeError, ValueError):
         duration = 0.0
-    return vcodec, pixfmt, acodec, container, subs, aidx, audios, duration
+    return vcodec, pixfmt, acodec, container, subs, aidx, audios, duration, attachments
 
 
 def choose_audio(audios: List[dict], want_index: Optional[int] = None) -> Optional[dict]:
@@ -105,13 +118,14 @@ def vcodec_copyable(vcodec: str, pix_fmt: str) -> bool:
 def build_hls_cmd(ffmpeg: str, url: str, out_dir: str, mode: str,
                   headers: Optional[Dict[str, str]] = None, probed: Optional[Tuple] = None,
                   want_audio: Optional[int] = None,
-                  ffprobe: str = "ffprobe", venc: Optional[list] = None) -> Tuple[list, dict]:
+                  ffprobe: str = "ffprobe", venc: Optional[list] = None,
+                  ua: Optional[str] = None) -> Tuple[list, dict]:
     """The single-pass HLS ffmpeg command + a decision info dict. Video copied when
     decodable else re-encoded via ``venc``; audio copied when AAC/MP3 else AAC.
     Subtitles are handled out-of-band, so nothing is muxed here."""
     venc = venc or DEFAULT_VENC
-    vcodec, pix_fmt, acodec, container, subs, aidx, audios, _dur = (
-        probed or probe(ffprobe, url, headers))
+    vcodec, pix_fmt, acodec, container, subs, aidx, audios, _dur, _atts = (
+        probed or probe(ffprobe, url, headers, ua=ua))
     chosen = choose_audio(audios, want_audio)
     if chosen:
         aidx, acodec = chosen["index"], chosen["codec"]
@@ -138,6 +152,7 @@ def build_hls_cmd(ffmpeg: str, url: str, out_dir: str, mode: str,
 
     cmd = [
         ffmpeg, "-y", "-hide_banner", "-loglevel", "warning",
+        *(["-user_agent", ua] if ua else []),
         *header_args(headers), *_RECONNECT,
         "-i", url,
         "-map", "0:v:0", "-map", amap,

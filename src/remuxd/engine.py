@@ -17,6 +17,7 @@ from typing import Dict, Optional
 
 from . import mkvcues
 from . import media
+from . import netio
 from . import subtitles
 from .config import Config
 from .netio import content_length, resolve_final, resolve_final_url
@@ -96,11 +97,17 @@ class Engine:
             # the same response (Content-Range) instead of probing it again later.
             final, fsize = resolve_final(src, cfg.user_agent, headers)
             tl.lap("resolve_url")
-            probed = media.probe(cfg.ffprobe, final, headers)
+            try:
+                probed = media.probe(cfg.ffprobe, final, headers, ua=cfg.user_agent)
+            except Exception as e:
+                raise StreamError(f"probe failed: {e}") from e
             tl.lap("probe")
             entry = _PrepEntry(final, fsize, probed, time.monotonic())
             self._prep_put(key, entry)
-        v, pf, a, cont, subs, aidx, audios, _dur = probed
+        v, pf, a, cont, subs, aidx, audios, _dur, _atts = probed
+        if not v and not audios:
+            raise StreamError("source has no video or audio streams "
+                              "(dead link or unsupported file)")
         chosen = media.choose_audio(audios, want_audio)
         if chosen:
             aidx, a = chosen["index"], chosen["codec"]
@@ -138,7 +145,7 @@ class Engine:
         """Per-segment on-demand path (copy or transcode). Needs an MKV Cues index;
         returns None (caller falls back to singlepass) when it can't be used."""
         cfg = self.cfg
-        v, pf, a, cont, subs, aidx, audios, dur = probed
+        v, pf, a, cont, subs, aidx, audios, dur, atts = probed
         if dur <= 0:
             return None
         if not ("matroska" in (cont or "") or "webm" in (cont or "")):
@@ -161,7 +168,14 @@ class Engine:
             windows = mkvcues.segment_grid(plan, dur, cfg.segment_seconds)
             if not windows:
                 return None
-            header_bytes = mkvcues.fetch_range(final, 0, plan["header_size"], headers)
+            raw_header = mkvcues.fetch_range(final, 0, plan["header_size"], headers)
+            # Fonts/attachments can be tens of MB and ride along on EVERY fragment
+            # pipe otherwise; the A/V remux never reads them.
+            header_bytes = mkvcues.strip_attachments(raw_header, plan["segment_offset"])
+            if len(header_bytes) != len(raw_header):
+                log.info("stripped %dKB of attachments from MKV header (%dKB -> %dKB)",
+                         (len(raw_header) - len(header_bytes)) // 1024,
+                         len(raw_header) // 1024, len(header_bytes) // 1024)
             if tl:
                 tl.lap("header_fetch")
             if prep is not None:
@@ -174,11 +188,11 @@ class Engine:
         sess.aac, sess.amap, sess.file_size = aac, amap, fsize
         sess.transcode = transcode
         sess.tracks = subtitles.sub_tracks(subs, sess.dir)
+        sess.attachments = atts
         sess.cache = FragmentCache(cfg.fragment_cache_bytes)
         if cfg.prefetch_segments > 0:
             sess.prefetch = PrefetchWorker(self, sess, cfg.prefetch_segments)
             sess.prefetch.start()
-        self._spawn_sub_extraction(sess, final, headers)
         if tl:
             tl.done(f"{'seek-transcode' if transcode else 'seek-copy'} "
                     f"sid={sess.sid} segs={len(windows)}")
@@ -197,8 +211,10 @@ class Engine:
         sess.url, sess.src, sess.headers = final, src, headers
         cmd, info = media.build_hls_cmd(cfg.ffmpeg, final, sess.dir, mode, headers,
                                         probed=probed, want_audio=want_audio,
-                                        ffprobe=cfg.ffprobe, venc=cfg.video_encode_args)
+                                        ffprobe=cfg.ffprobe, venc=cfg.video_encode_args,
+                                        ua=cfg.user_agent)
         sess.tracks = subtitles.sub_tracks(info.get("subs_streams") or [], sess.dir)
+        sess.attachments = probed[-1] if probed else []
         sess.proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
         proc = sess.proc
 
@@ -217,9 +233,6 @@ class Engine:
             raise StreamError("timed out waiting for first HLS segment")
         if tl:
             tl.lap("first_segment")
-
-        self._spawn_sub_extraction(sess, final, headers)
-        if tl:
             tl.done(f"singlepass sid={sess.sid}")
         return self._info(
             sess, info["video"], info["pix_fmt"], info["audio"], info["container"],
@@ -227,46 +240,131 @@ class Engine:
             playlist=f"/hls/{sess.sid}/index.m3u8",
             tracks=sess.tracks, audio_meta=audio_meta)
 
+    # Each per-segment ffmpeg gets this long; segment waiters allow a bit more
+    # (a waiter that gives up before the producer's deadline duplicates its work).
+    FRAGMENT_TIMEOUT = 180
+
+    # Minimum seconds between debrid-resolver lookups per session — a dead link
+    # plus the prefetch worker's retries would otherwise hammer it into 429s.
+    _REFRESH_COOLDOWN = 30.0
+
+    def _refresh_url(self, sess: Session, failed_url: str) -> str:
+        """Re-resolve the CDN link, serialized per session so concurrent fetch
+        failures piggyback on the first lookup. Callers get the current URL
+        unchanged when throttled by _REFRESH_COOLDOWN."""
+        with sess.url_lock:
+            if sess.url != failed_url:
+                return sess.url          # someone already refreshed it
+            now = time.monotonic()
+            if now - sess.url_refreshed_at < self._REFRESH_COOLDOWN:
+                return sess.url          # throttled: don't touch the resolver
+            sess.url_refreshed_at = now
+            new = resolve_final_url(sess.src, self.cfg.user_agent, sess.headers)
+            # resolve_final_url falls back to returning src on failure. Never
+            # adopt that: src is the debrid playback link that re-runs a lookup
+            # on every hit, so each later fetch would re-hit the resolver.
+            if new and new != sess.src:
+                sess.url = new
+            return sess.url
+
     def fragment(self, sess: Session, i: int):
-        """Produce fragment i: fetch its cluster bytes (+ MKV header) via Range and
-        remux to fMP4. Returns (init, media_bytes, err); re-resolves the link once
-        if a byte fetch fails."""
+        """Produce fragment i: stream its cluster bytes (+ MKV header) into ffmpeg
+        as they download, so fetch and remux overlap (cold latency ~ max(fetch,
+        remux) instead of their sum) and the window is never buffered whole in
+        memory. Returns (init, media_bytes, err); re-resolves the link once if
+        opening the byte range fails."""
         w = sess.windows[i]
 
-        def build_blob(url):
-            return sess.header_bytes + mkvcues.fetch_range(url, w["boff"], w["bend"], sess.headers)
+        def open_win(url):
+            return netio.open_url(url, self.cfg.user_agent, sess.headers,
+                                  rng=(w["boff"], w["bend"]), timeout=60)
 
         t0 = time.perf_counter()
+        old_url = sess.url
         try:
-            blob = build_blob(sess.url)
+            resp = open_win(old_url)
         except Exception:
-            sess.url = resolve_final_url(sess.src, self.cfg.user_agent, sess.headers)
-            blob = build_blob(sess.url)
-        t_fetch = (time.perf_counter() - t0) * 1000
+            resp = open_win(self._refresh_url(sess, old_url))
+        t_open = (time.perf_counter() - t0) * 1000
 
         t1 = time.perf_counter()
-        p = subprocess.Popen(media.segment_transcode_cmd(self.cfg.ffmpeg, self.cfg.video_encode_args,
-                                                         sess.aac, sess.amap)
-                             if sess.transcode
-                             else media.segment_cmd(self.cfg.ffmpeg, sess.aac, sess.amap),
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
-        try:
-            out, err = p.communicate(blob, timeout=180)
-        except subprocess.TimeoutExpired:
+        killed = threading.Event()
+        p = timer = None
+        fed_owns_resp = False
+        fed = [0]
+
+        def _kill():
+            killed.set()
             p.kill()
-            p.communicate()      # reap; don't leave a hung ffmpeg holding a slot
+
+        def feed():
+            try:
+                p.stdin.write(sess.header_bytes)
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    p.stdin.write(chunk)
+                    fed[0] += len(chunk)
+            except (BrokenPipeError, OSError):
+                pass               # ffmpeg exited/killed, or upstream dropped
+            finally:
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
+                resp.close()
+
+        err_buf = []
+        # Until feeder.start() succeeds nothing else will ever close `resp`, so
+        # everything up to the handoff has to clean up after itself — otherwise a
+        # failure here (no ffmpeg, thread limit) leaks a pooled connection and
+        # orphans the child.
+        try:
+            p = subprocess.Popen(
+                media.segment_transcode_cmd(self.cfg.ffmpeg, self.cfg.video_encode_args,
+                                            sess.aac, sess.amap)
+                if sess.transcode
+                else media.segment_cmd(self.cfg.ffmpeg, sess.aac, sess.amap),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            timer = threading.Timer(self.FRAGMENT_TIMEOUT, _kill)
+            timer.daemon = True
+            timer.start()
+            feeder = threading.Thread(target=feed, name=f"feed-{sess.sid}#{i}",
+                                      daemon=True)
+            # stderr drained on its own thread so ffmpeg can't deadlock on a full pipe
+            drainer = threading.Thread(target=lambda: err_buf.append(p.stderr.read()),
+                                       daemon=True)
+            feeder.start()
+            fed_owns_resp = True     # from here on feed()'s finally closes it
+            drainer.start()
+        except BaseException:
+            if timer is not None:
+                timer.cancel()
+            if p is not None:
+                p.kill()
+                p.wait()
+            if not fed_owns_resp:
+                resp.close()
+            raise
+        out = p.stdout.read()
+        p.wait()
+        timer.cancel()
+        feeder.join(timeout=10)
+        drainer.join(timeout=10)
+        err = err_buf[0] if err_buf else b""
+        t_ff = (time.perf_counter() - t1) * 1000
+        if killed.is_set():
             log.warning("[seg %d] ffmpeg timed out", i)
             return None, None, b"ffmpeg timeout"
-        t_ff = (time.perf_counter() - t1) * 1000
         if not out:
             log.warning("[seg %d] empty window=%.2f-%.2f bytes[%s:%s] stderr=%s",
                         i, w["start"], w["end"], w["boff"], w["bend"],
                         err.decode(errors="replace").strip()[-500:])
             return None, None, err
         init, media_bytes = media.split_init(out)
-        log.debug("[frag %s#%d] fetch=%.0fms(%dKB) %s=%.0fms out=%dKB",
-                  sess.sid, i, t_fetch, len(blob) // 1024,
+        log.debug("[frag %s#%d] open=%.0fms fed=%dKB %s=%.0fms out=%dKB",
+                  sess.sid, i, t_open, fed[0] // 1024,
                   "encode" if sess.transcode else "remux", t_ff, len(out) // 1024)
         return init, media_bytes, None
 
@@ -288,16 +386,28 @@ class Engine:
             return cached
         should, ev = sess.cache.claim(i)
         if not should:
+            if ev is None:      # raced with a producer: cached between get and claim
+                return sess.cache.get(i)
             # someone else (usually the prefetch worker) is already fetching it —
-            # wait for their result instead of re-downloading the same bytes.
-            if ev is not None and ev.wait(timeout=120):
-                cached = sess.cache.get(i)
-                if cached is not None:
-                    log.debug("[seg %s#%d] in-flight-hit (%dKB)", sess.sid, i, len(cached) // 1024)
-                    return cached
-            sess.cache.claim(i)   # producer failed/evicted -> take over
+            # wait for their result instead of re-downloading the same bytes. The
+            # wait must outlast the producer's ffmpeg deadline or we'd duplicate
+            # work the producer is still doing.
+            ev.wait(timeout=self.FRAGMENT_TIMEOUT + 60)
+            cached = sess.cache.get(i)
+            if cached is not None:
+                log.debug("[seg %s#%d] in-flight-hit (%dKB)", sess.sid, i, len(cached) // 1024)
+                return cached
+            should, _ev = sess.cache.claim(i)   # producer failed/evicted -> take over
+            if not should:
+                # cached in the meantime, or a producer is somehow still running
+                # past its deadline — either way don't pile on another fetch.
+                return sess.cache.get(i)
 
-        init, media_bytes, _err = self.fragment(sess, i)
+        try:
+            init, media_bytes, _err = self.fragment(sess, i)
+        except Exception:
+            sess.cache.release(i)   # never leak the claim: waiters would hang on it
+            raise
         if media_bytes is None:
             sess.cache.release(i)
             return None
@@ -316,10 +426,22 @@ class Engine:
             self.serve_segment(sess, 0)
         return sess.init
 
-    def subwindow(self, sess: Session, n: int, t: float) -> bytes:
+    # Past subtitle windows kept per session. Each is a few KB of text (the MBs
+    # fetched to produce it aren't retained), so this is cheap.
+    _SUBWIN_CACHE_MAX = 64
+
+    # Seconds ahead of a requested window to warm in the background — playback
+    # runs off the end of a window faster than the next one takes to fetch.
+    _SUBWIN_AHEAD = 45.0
+
+    def subwindow(self, sess: Session, n: int, t: float, warm: bool = True) -> bytes:
         """On-demand ASS around time ``t``: extract track n from the clusters
         spanning ~[t-10, t+45] with -copyts (preserve absolute timestamps).
-        Re-resolves the link once if the fetch comes back empty."""
+        Re-resolves the link once if the fetch comes back empty.
+
+        Results are cached per byte window and concurrent callers of the same
+        window share one extraction. ``warm`` also pulls the following window in
+        the background; it is False on those calls so warming never chains."""
         wins = sess.windows or []
         if n < 0 or n >= len(sess.tracks):
             return b""
@@ -333,6 +455,24 @@ class Engine:
                     bend = be if bend is None else max(bend, be)
         if boff is None:
             return b""
+        key = (n, boff, bend)
+
+        while True:
+            with sess.subwin_lock:
+                if key in sess.subwin:
+                    return sess.subwin[key]
+                waiting = sess.subwin_inflight.get(key)
+                if waiting is None:
+                    done = threading.Event()
+                    sess.subwin_inflight[key] = done
+                    break
+            # someone else is extracting this exact window — ride along, and if
+            # their attempt failed report that rather than re-paying the fetch
+            waiting.wait(timeout=180)
+            with sess.subwin_lock:
+                return sess.subwin.get(key, b"")
+
+        out = b""
         idx = sess.tracks[n]["index"]
 
         def extract(url):
@@ -340,20 +480,59 @@ class Engine:
                                             boff, bend, idx, sess.headers)
 
         try:
-            out = extract(sess.url)
-        except Exception:
-            out = b""
-        if not out:   # link may have expired -> re-resolve once
-            sess.url = resolve_final_url(sess.src, self.cfg.user_agent, sess.headers)
-            out = extract(sess.url)
+            old_url = sess.url
+            try:
+                out = extract(old_url)
+            except Exception:
+                out = b""
+            if not out:   # link may have expired -> re-resolve once (serialized)
+                try:
+                    out = extract(self._refresh_url(sess, old_url))
+                except Exception:
+                    out = b""
+        finally:
+            with sess.subwin_lock:
+                if out:
+                    if len(sess.subwin) >= self._SUBWIN_CACHE_MAX:
+                        sess.subwin.pop(next(iter(sess.subwin)), None)   # oldest
+                    sess.subwin[key] = out
+                sess.subwin_inflight.pop(key, None)
+                done.set()
+        if out and warm:
+            threading.Thread(
+                target=self._warm_subwindow, args=(sess, n, t + self._SUBWIN_AHEAD),
+                name=f"subwarm-{sess.sid}", daemon=True).start()
         return out
 
-    def _spawn_sub_extraction(self, sess: Session, url: str, headers) -> None:
-        if not sess.tracks:
+    def _warm_subwindow(self, sess: Session, n: int, t: float) -> None:
+        # Through the prefetch budget: this pulls the same tens of MB a video
+        # fragment does, and it must never outbid the fragments playback needs.
+        if not self._prefetch_sem.acquire(timeout=30):
             return
+        try:
+            self.subwindow(sess, n, t, warm=False)
+        except Exception:
+            log.debug("subwindow warm failed", exc_info=True)
+        finally:
+            self._prefetch_sem.release()
+
+    def ensure_sub_extraction(self, sess: Session) -> None:
+        """Kick off the full-file subtitle+font extraction on first demand. Lazy
+        because it downloads the ENTIRE source: sessions whose client never asks
+        for subs (or only uses /subwindow) skip a whole-file read."""
+        if not sess.tracks or not sess.url or sess.subs_started:
+            return
+        with sess.lock:
+            if sess.subs_started:
+                return
+            sess.subs_started = True
         threading.Thread(
             target=subtitles.extract_all,
-            args=(self.cfg.ffmpeg, url, sess.tracks, sess.fonts_dir(), headers),
+            args=(self.cfg.ffmpeg, sess.url, sess.tracks, sess.fonts_dir(),
+                  sess.headers),
+            kwargs={"ua": self.cfg.user_agent,
+                    "attachments": sess.attachments,
+                    "refresh_url": lambda failed: self._refresh_url(sess, failed)},
             name=f"subs-{sess.sid}", daemon=True).start()
 
     def _info(self, sess, video, pix_fmt, audio, container, mode, video_action,
@@ -380,7 +559,13 @@ class PrefetchWorker(threading.Thread):
     either direction and the worker abandons its window mid-pass to refocus, so it
     warms the seek target promptly instead of finishing the stale window. Large
     read_ahead ~= download the whole file ahead, bounded by the cache byte budget.
+
+    If the client stops requesting anything for IDLE_PAUSE seconds (switched to
+    another stream, closed the tab without /stop), the worker pauses instead of
+    downloading the rest of the file for nobody; the next request resumes it.
     """
+
+    IDLE_PAUSE = 60.0
 
     def __init__(self, engine: "Engine", sess: Session, read_ahead: int):
         super().__init__(name=f"prefetch-{sess.sid}", daemon=True)
@@ -403,8 +588,15 @@ class PrefetchWorker(threading.Thread):
     def run(self) -> None:
         sess = self.sess
         n = len(sess.windows or [])
+        idle_wait = 2.0
         while not self._stop.is_set():
-            produced = refocus = False
+            if time.monotonic() - sess.last_access > self.IDLE_PAUSE:
+                # nobody is watching — idle until a request touches the session
+                # (notify() also wakes us immediately on the next segment hit)
+                self._wake.wait(timeout=5.0)
+                self._wake.clear()
+                continue
+            produced = refocus = errors = False
             ph = sess.playhead
             hi = min(n, ph + 1 + self.read_ahead)
             for i in range(ph, hi):
@@ -421,10 +613,15 @@ class PrefetchWorker(threading.Thread):
                 if not self.engine._prefetch_sem.acquire(timeout=5):
                     sess.cache.release(i)
                     break
+                _init = media_bytes = None
                 try:
-                    if self._stop.is_set():
-                        break
-                    _init, media_bytes, _err = self.engine.fragment(sess, i)
+                    if not self._stop.is_set():
+                        _init, media_bytes, _err = self.engine.fragment(sess, i)
+                except Exception:
+                    # a failed fetch must not kill the worker (read-ahead for the
+                    # whole session would silently stop)
+                    log.warning("[prefetch %s#%d] failed", sess.sid, i, exc_info=True)
+                    errors = True
                 finally:
                     self.engine._prefetch_sem.release()
                 if media_bytes is not None:
@@ -435,9 +632,18 @@ class PrefetchWorker(threading.Thread):
                                 sess.init = _init
                     produced = True
                 else:
+                    # claim must never leak — on-demand waiters block on it
                     sess.cache.release(i)
+                    if not self._stop.is_set():
+                        errors = True
             if refocus or self._stop.is_set():
                 continue              # re-point without waiting
+            if produced:
+                idle_wait = 2.0       # healthy again -> normal cadence
             if not produced:
-                self._wake.wait(timeout=2.0)
+                if errors:
+                    # upstream is failing (dead link, 429): back off instead of
+                    # re-hitting it every 2s — a seek/wake still resumes instantly
+                    idle_wait = min(60.0, idle_wait * 2)
+                self._wake.wait(timeout=idle_wait)
                 self._wake.clear()

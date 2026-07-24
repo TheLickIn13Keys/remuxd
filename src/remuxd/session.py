@@ -18,6 +18,10 @@ from typing import Dict, List, Optional
 log = logging.getLogger("remuxd.session")
 
 
+class CapacityError(RuntimeError):
+    """Session cap reached and every existing session is recently active."""
+
+
 class FragmentCache:
     """Bounded in-memory cache of fMP4 media fragments (index -> bytes). Over budget
     it evicts the fragment farthest from the playhead, keeping a window (back-buffer
@@ -95,7 +99,10 @@ class Session:
         self.tracks: List[dict] = []
         self.created = time.monotonic()
         self.last_access = self.created
-        self.lock = threading.Lock()   # guards init caching / url re-resolve
+        self.lock = threading.Lock()       # guards init caching / subs_started
+        # separate from `lock`: refreshing blocks on a network round-trip, and
+        # must not stall the request-path work `lock` protects
+        self.url_lock = threading.Lock()
 
         # passthrough / seek
         self.url: Optional[str] = None
@@ -113,6 +120,20 @@ class Session:
         self.prefetch = None            # engine.PrefetchWorker, set on start
         self.playhead: int = 0          # client's current segment index
         self.transcode: bool = False    # seek: re-encode each fragment vs copy
+        # full-file subtitle/font extraction started (lazy: first /subs or
+        # /fontlist hit triggers it, since it downloads the whole source)
+        self.subs_started: bool = False
+        # /subwindow results, (track, boff, bend) -> ASS bytes, plus in-flight
+        # events under the same key. A window costs tens of MB of upstream fetch,
+        # so seeking back over one must not re-pay it and concurrent callers
+        # must share one extraction.
+        self.subwin: Dict[tuple, bytes] = {}
+        self.subwin_inflight: Dict[tuple, threading.Event] = {}
+        self.subwin_lock = threading.Lock()
+        # attachment streams from the probe (embedded fonts), for explicit dumping
+        self.attachments: List[dict] = []
+        # last debrid re-resolve (monotonic); throttles resolver lookups (429s)
+        self.url_refreshed_at: float = 0.0
         # singlepass
         self.proc: Optional[subprocess.Popen] = None
 
@@ -147,10 +168,15 @@ class Session:
 class SessionManager:
     """Thread-safe registry of sessions with TTL reaping and a concurrency cap."""
 
-    def __init__(self, root: str, ttl_seconds: int = 1800, max_sessions: int = 32):
+    def __init__(self, root: str, ttl_seconds: int = 1800, max_sessions: int = 32,
+                 min_evict_idle: float = 60.0):
         self.root = root
         self.ttl = ttl_seconds
         self.max_sessions = max_sessions
+        # only sessions idle at least this long may be evicted to make room; if
+        # every session is younger, create() raises CapacityError instead of
+        # killing someone's live stream.
+        self.min_evict_idle = min_evict_idle
         self._sessions: Dict[str, Session] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -160,8 +186,9 @@ class SessionManager:
         self._reaper.start()
 
     def create(self, kind: str) -> Session:
-        """Allocate a new session (and its working dir). Evicts the least-recently
-        used session first if the concurrency cap would be exceeded."""
+        """Allocate a new session (and its working dir). If the concurrency cap is
+        hit, evicts the least-recently-used *idle* session; raises CapacityError
+        when every session is recently active (callers answer 503)."""
         sid = uuid.uuid4().hex[:12]
         out_dir = os.path.join(self.root, sid)
         os.makedirs(out_dir, exist_ok=True)
@@ -169,11 +196,18 @@ class SessionManager:
         evicted = None
         with self._lock:
             if self.max_sessions and len(self._sessions) >= self.max_sessions:
-                oldest = min(self._sessions.values(), key=lambda s: s.last_access)
+                now = time.monotonic()
+                idle = [s for s in self._sessions.values()
+                        if now - s.last_access >= self.min_evict_idle]
+                if not idle:
+                    raise CapacityError(
+                        f"at capacity ({self.max_sessions} active sessions)")
+                oldest = min(idle, key=lambda s: s.last_access)
                 evicted = self._sessions.pop(oldest.sid, None)
             self._sessions[sid] = sess
         if evicted:
-            log.info("evicting session %s (cap %d reached)", evicted.sid, self.max_sessions)
+            log.info("evicting idle session %s (cap %d reached)",
+                     evicted.sid, self.max_sessions)
             evicted.close()
         log.info("session %s created (%s)", sid, kind)
         return sess
@@ -205,11 +239,17 @@ class SessionManager:
                 s.close()
 
     def shutdown(self) -> None:
-        """Stop the reaper and tear down every session + the root dir."""
+        """Stop the reaper and tear down every session. Only removes the root dir
+        if it's empty afterwards — the root may be a pre-existing directory the
+        user pointed us at (REMUXD_SESSION_ROOT=/tmp would be catastrophic to
+        rmtree)."""
         self._stop.set()
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
         for s in sessions:
             s.close()
-        shutil.rmtree(self.root, ignore_errors=True)
+        try:
+            os.rmdir(self.root)
+        except OSError:
+            pass   # not empty / already gone — leave it alone

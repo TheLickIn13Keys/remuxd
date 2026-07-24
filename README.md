@@ -74,6 +74,7 @@ curl 'http://127.0.0.1:8000/start?src=<url-encoded-mkv-url>&mode=remux'
 | `GET /subwindow/<sid>?n=&t=` | on-demand ASS around a seek position (seek-copy) |
 | `GET /fonts/<sid>/<name>`, `GET /fontlist/<sid>` | embedded MKV fonts for the renderer |
 | `GET /resolve?anilist=<id>` | optional resolver plugin (if configured) |
+| `POST /stop/<sid>` | tear the session down now (kills prefetch/ffmpeg, frees the cache) |
 
 - `mode`: `remux` (copy, default) · `auto` · `transcode`
 - `headers`: URL-encoded JSON of upstream request headers (auth, etc.)
@@ -96,8 +97,9 @@ uses JASSUB, but that's just the demo's choice).
 | `REMUXD_PREFETCH_CONCURRENCY` | `6` | global cap on concurrent prefetch ffmpeg jobs (on-demand requests are never throttled) |
 | `REMUXD_SESSION_TTL` | `1800` | idle seconds before a session is reaped |
 | `REMUXD_PREP_CACHE_TTL` | `120` | seconds to memoize per-source prep (resolved URL, probe, cues index, header) so a repeat `/start` — audio switch, replay — skips it; `0` disables |
-| `REMUXD_MAX_SESSIONS` | `32` | concurrency cap (0 = unlimited) |
+| `REMUXD_MAX_SESSIONS` | `32` | concurrency cap (0 = unlimited). At the cap, sessions idle >60 s are evicted LRU-first; if every session is active, `/start` answers **503** instead of killing a live stream |
 | `REMUXD_USER_AGENT` | Chrome UA | UA for upstream fetches |
+| `REMUXD_CORS_ORIGIN` | *(unset)* | if set (e.g. `https://player.example.com` or `*`), all responses carry `Access-Control-Allow-Origin` and `OPTIONS` preflights are answered — needed when a frontend on another origin drives the API |
 | `REMUXD_LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
 ## Read-ahead / pre-buffering
@@ -148,6 +150,23 @@ re-opening or re-picking a title skips the slow debrid search.
 
 ## Notes
 
-- Single-file, stdlib-only server (`http.server`) — no framework, no runtime deps.- Sessions are reaped on idle and on shutdown; working dirs are cleaned up.
+- Single-file, stdlib-only server (`http.server`) — no framework, no runtime deps.
+- `src` must be an `http(s)` URL (other schemes are rejected — `file://` etc. would
+  be a local-file-read / SSRF hole). Pass it URL-encoded **once**.
+- Upstream fetches use pooled keep-alive connections (one TLS handshake per host,
+  not per segment); fragment bytes stream straight into ffmpeg while downloading.
+- Full-file subtitle/font extraction is lazy: it starts on the first `/subs` or
+  `/fontlist` hit, so clients that never ask for subs don't trigger a whole-file
+  download. `/subwindow` works independently of it.
+- `POST /stop/<sid>` when the user switches away from a stream — otherwise it
+  lingers until the idle TTL. As a safety net, a session's read-ahead worker
+  pauses after 60 s without a client request, so an abandoned session stops
+  downloading even if `/stop` is never called.
+- Sessions are reaped on idle and on shutdown; working dirs are cleaned up. The
+  session root itself is only removed if empty (pointing `REMUXD_SESSION_ROOT` at
+  an existing directory is safe).
+- Segments, `init.mp4`, and seekable playlists are served with immutable
+  `Cache-Control`; growing resources (live playlists, subs being extracted) are
+  `no-store`. `HEAD` is supported on the read-only endpoints.
 - For public exposure, front it with a reverse proxy (TLS, auth, rate limiting)
   and pin `REMUXD_MAX_SESSIONS` to your ffmpeg/CPU budget.

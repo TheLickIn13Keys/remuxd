@@ -65,6 +65,10 @@ class Config:
     user_agent: str = DEFAULT_UA        # UA for upstream fetches
     demo: bool = False                  # serve the browser demo + assets at "/"
     log_level: str = "INFO"
+    # If set, every response carries Access-Control-Allow-Origin with this value
+    # (e.g. "https://player.example.com" or "*"), so a frontend on another origin
+    # can drive the API. Empty = no CORS headers.
+    cors_origin: str = ""
 
     @property
     def fragment_cache_bytes(self) -> int:
@@ -95,6 +99,7 @@ class Config:
             user_agent=os.environ.get("REMUXD_USER_AGENT", DEFAULT_UA),
             demo=os.environ.get("REMUXD_DEMO", "").lower() in ("1", "true", "yes"),
             log_level=os.environ.get("REMUXD_LOG_LEVEL", "INFO").upper(),
+            cors_origin=os.environ.get("REMUXD_CORS_ORIGIN", ""),
         )
         for k, v in overrides.items():
             setattr(cfg, k, v)
