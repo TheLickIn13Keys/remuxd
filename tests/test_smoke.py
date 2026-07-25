@@ -360,8 +360,10 @@ def test_resolver_cache():
     anilist._cache.clear()
     calls = {"n": 0}
     orig = anilist._resolve_streams
+    # non-empty: an empty result set is deliberately not memoized
+    ranked = [{"filename": "x.mkv", "_decision": {}, "_score": 1}]
     anilist._resolve_streams = lambda aid, s, e, tl=None: (calls.__setitem__("n", calls["n"] + 1)
-                                                           or ("tt1:1:1", []))
+                                                           or ("tt1:1:1", ranked))
     try:
         r1 = anilist.resolve_api("154587")
         r2 = anilist.resolve_api("154587")
@@ -374,6 +376,200 @@ def test_resolver_cache():
         anilist._resolve_streams = orig
         anilist._cache.clear()
         os.environ.pop("AIO_CACHE_TTL", None)
+
+
+def test_anibridge_episode_ranges():
+    """The mappings range syntax: plain, offset, open-ended, split and ratio'd."""
+    from remuxd.plugins.anibridge import _map_episode as m
+    assert m("1-26", "1-26", 5) == 5
+    assert m("1-26", "1-26", 27) is None            # outside the source range
+    assert m("62-77", "62-77", 62) == 62
+    assert m("36-83", "1-48", 37) == 2              # season-relative target
+    assert m("14-", "13-", 20) == 19                # open-ended both sides
+    assert m("1-12", "1-6,8-13", 7) == 8            # skips the gap
+    assert m("13-", "14-|2", 14) == 16              # 1 source ep = 2 target eps
+    assert m("1-12", "1-6|-2", 4) == 2              # 2 source eps = 1 target ep
+    assert m("1-2", "1", 2) is None                 # target range exhausted
+    assert m("1", None, 1) is None                  # explicitly unmapped
+
+
+def test_anibridge_lookup_prefers_richest_target():
+    """Film -> imdb, series -> tmdb over tvdb, with the episode translated."""
+    from remuxd.plugins import anibridge
+    payload = {"targets": [
+        {"provider": "tvdb_show", "entry_id": "78857", "scope": "s2",
+         "ranges": [{"source_range": "36-83", "effective": "1-48"}]},
+        {"provider": "tmdb_show", "entry_id": "46260", "scope": "s2",
+         "ranges": [{"source_range": "53-104", "effective": "53-104"}]},
+        {"provider": "mal", "entry_id": "20", "scope": None,
+         "ranges": [{"source_range": "1-220", "effective": "1-220"}]},
+    ]}
+    orig = anibridge._mapping
+    anibridge._mapping = lambda a: payload
+    try:
+        assert anibridge.lookup(20, 60) == ("tmdb:46260:2:60", "series")
+        assert anibridge.lookup(20, 300) == (None, None)      # no range covers it
+        payload["targets"] = [t for t in payload["targets"]
+                              if t["provider"] != "tmdb_show"]
+        assert anibridge.lookup(20, 40) == ("tvdb:78857:2:5", "series")
+        payload["targets"].append(
+            {"provider": "imdb_movie", "entry_id": "tt0275277", "scope": None,
+             "ranges": [{"source_range": "1", "effective": "1"}]})
+        assert anibridge.lookup(20, 1) == ("tt0275277", "movie")   # film wins
+        payload["targets"][-1]["deleted"] = True                   # ...unless deleted
+        assert anibridge.lookup(20, 1) == (None, None)
+        assert anibridge.lookup(20, 40) == ("tvdb:78857:2:5", "series")
+        anibridge._mapping = lambda a: None                    # unknown / instance down
+        assert anibridge.lookup(20, 1) == (None, None)
+        os.environ["ANIBRIDGE_DISABLE"] = "1"
+        anibridge._mapping = lambda a: payload
+        assert anibridge.lookup(20, 60) == (None, None)
+    finally:
+        anibridge._mapping = orig
+        os.environ.pop("ANIBRIDGE_DISABLE", None)
+
+
+def test_anibridge_does_not_cache_outages():
+    """An unreachable instance must not poison the memo: the next call retries.
+
+    A real "no mapping" answer is cached; a failure to ask isn't (regression for
+    '0 streams until you restart the container').
+    """
+    from remuxd.plugins import anibridge
+    calls = {"n": 0}
+    answers = [anibridge.UNAVAILABLE, None, {"targets": []}]
+    orig = anibridge._fetch
+    anibridge._fetch = lambda a: (calls.__setitem__("n", calls["n"] + 1)
+                                  or answers[min(calls["n"] - 1, len(answers) - 1)])
+    anibridge._cache.clear()
+    try:
+        assert anibridge._mapping("77") is anibridge.UNAVAILABLE
+        assert not anibridge._cache                    # nothing cached
+        assert anibridge._mapping("77") is None        # retried -> real miss
+        assert anibridge._mapping("77") is None        # served from cache
+        assert calls["n"] == 2
+    finally:
+        anibridge._fetch = orig
+        anibridge._cache.clear()
+
+
+def test_anibridge_backs_off_only_on_timeouts():
+    """A refused connection is retried at once; a timeout arms the skip window."""
+    import urllib.error
+    from remuxd.plugins import anibridge
+    assert not anibridge._slow_failure(urllib.error.URLError(ConnectionRefusedError()))
+    assert anibridge._slow_failure(TimeoutError())
+    assert anibridge._slow_failure(urllib.error.URLError(TimeoutError()))
+
+    calls = {"n": 0}
+    orig_open, orig_down = anibridge.urllib.request.urlopen, anibridge._down_until
+
+    def refuse(*a, **kw):
+        calls["n"] += 1
+        raise urllib.error.URLError(ConnectionRefusedError())
+
+    anibridge.urllib.request.urlopen = refuse
+    anibridge._down_until = 0.0
+    anibridge._cache.clear()
+    try:
+        assert anibridge.lookup(77) == (None, None)
+        assert anibridge.lookup(77) == (None, None)
+        assert calls["n"] == 2                     # tried again, no back-off
+        assert anibridge._down_until == 0.0
+    finally:
+        anibridge.urllib.request.urlopen = orig_open
+        anibridge._down_until = orig_down
+        anibridge._cache.clear()
+
+
+def test_resolver_does_not_cache_empty_results():
+    """A search that found nothing is retried on the next call, not memoized."""
+    import os
+    from remuxd.plugins import anilist
+    os.environ["AIO_CACHE_TTL"] = "60"
+    anilist._cache.clear()
+    found = {"n": 0, "results": []}
+    orig = anilist._resolve_streams
+    anilist._resolve_streams = lambda aid, s, e, tl=None: (
+        found.__setitem__("n", found["n"] + 1) or ("tt1:1:1", found["results"]))
+    try:
+        assert anilist.resolve_api("210031")["results"] == []
+        assert anilist.resolve_api("210031")["results"] == []
+        assert found["n"] == 2                         # empty -> searched again
+        found["results"] = [{"filename": "x.mkv", "_decision": {}, "_score": 1}]
+        assert len(anilist.resolve_api("210031")["results"]) == 1
+        anilist.resolve_api("210031")
+        assert found["n"] == 3                         # non-empty -> memoized
+    finally:
+        anilist._resolve_streams = orig
+        anilist._cache.clear()
+        os.environ.pop("AIO_CACHE_TTL", None)
+
+
+def test_anime_ids_fallback():
+    """Offline Kometa dataset fills in the imdb mapping the anime api missed."""
+    import json
+    from remuxd.plugins import animeids
+    snapshot = {
+        "11": {"tvdb_id": 70900, "tvdb_season": 0, "tvdb_epoffset": 2,
+               "imdb_id": "tt7941838,tt0000002", "anilist_id": 821},
+        "43": {"tvdb_id": 78960, "tvdb_season": 2, "tvdb_epoffset": 12,
+               "imdb_id": "tt0275230", "anilist_id": "405,406"},
+        "99": {"tvdb_epoffset": 0, "anilist_id": 1},          # no imdb -> skipped
+    }
+    path = os.path.join(os.path.dirname(__file__), ".anime-ids-test.json")
+    with open(path, "w") as f:
+        json.dump(snapshot, f)
+    os.environ["ANIME_IDS_CACHE"] = path
+    os.environ["ANIME_IDS_TTL"] = "0"                          # never refetch
+    animeids._index, animeids._failed_at = None, 0.0
+    try:
+        assert animeids.lookup(821) == ("tt7941838", True, None, None)   # film
+        assert animeids.lookup("405") == ("tt0275230", False, 2, 13)     # s2, ep offset
+        assert animeids.lookup(406) == ("tt0275230", False, 2, 13)       # comma list
+        assert animeids.lookup(1) == (None, None, None, None)            # no imdb
+        assert animeids.lookup(999999) == (None, None, None, None)       # unknown
+        os.environ["ANIME_IDS_DISABLE"] = "1"
+        assert animeids.lookup(821) == (None, None, None, None)
+    finally:
+        for k in ("ANIME_IDS_CACHE", "ANIME_IDS_TTL", "ANIME_IDS_DISABLE"):
+            os.environ.pop(k, None)
+        animeids._index, animeids._failed_at = None, 0.0
+        os.remove(path)
+
+
+def test_anime_ids_used_when_api_cannot_map():
+    """_resolve_streams falls back to the dataset, and keeps the api's type hint."""
+    from remuxd.plugins import anilist
+    searched = {}
+    orig_map, orig_search, orig_lookup = (
+        anilist._map_to_imdb, anilist._search, anilist.animeids.lookup)
+    orig_bridge = anilist.anibridge.lookup
+    anilist._search = lambda mid, mtype="series": searched.update(id=mid, type=mtype) or []
+    anilist.anibridge.lookup = lambda a, ep=1: (None, None)   # exercise the kometa leg
+    try:
+        # api knows nothing at all -> dataset supplies both the id and the type
+        anilist._map_to_imdb = lambda a: (None, None, None, None)
+        anilist.animeids.lookup = lambda a: ("tt0275230", False, 2, 13)
+        anilist._resolve_streams("405", season=1, episode=3)
+        assert searched == {"id": "tt0275230:2:15", "type": "series"}
+        # api says "movie" but has no imdb id -> its type wins over the guess
+        anilist._map_to_imdb = lambda a: (None, True, None, None)
+        anilist.animeids.lookup = lambda a: ("tt7941838", False, 1, 1)
+        anilist._resolve_streams("821", season=1, episode=1)
+        assert searched == {"id": "tt7941838", "type": "movie"}
+        # nothing maps -> unchanged anilist search path
+        anilist.animeids.lookup = lambda a: (None, None, None, None)
+        anilist._map_to_imdb = lambda a: (None, None, None, None)
+        anilist._resolve_streams("999", season=1, episode=4)
+        assert searched == {"id": "anilist:999:4", "type": "series"}
+        # anibridge is tried first and wins when it has an answer
+        anilist.anibridge.lookup = lambda a, ep=1: (f"tmdb:95479:1:{ep}", "series")
+        anilist._resolve_streams("113415", season=1, episode=7)
+        assert searched == {"id": "tmdb:95479:1:7", "type": "series"}
+    finally:
+        anilist._map_to_imdb, anilist._search = orig_map, orig_search
+        anilist.animeids.lookup, anilist.anibridge.lookup = orig_lookup, orig_bridge
 
 
 def test_fragment_cache_keeps_readahead():
@@ -559,6 +755,214 @@ def test_refresh_url_throttles_and_never_adopts_src():
         sm.shutdown()
 
 
+def test_fragment_does_not_repeat_a_refused_request():
+    """A 429 is not link expiry: re-requesting only doubles load on a host that is
+    already refusing us, so fragment() raises after one attempt and arms the
+    session-wide backoff."""
+    from remuxd import engine as eng_mod
+    from remuxd.netio import UpstreamError
+    cfg = Config(session_root="./.remuxd-test-429")
+    sm = SessionManager(cfg.session_root, 60, 4)
+    opens = []
+    orig_open = eng_mod.netio.open_url
+    try:
+        eng = Engine(cfg, sm)
+        sess = sm.create("seek")
+        sess.src, sess.url = "http://debrid/play", "http://cdn/live"
+        sess.windows = [{"start": 0, "end": 6, "boff": 0, "bend": 10}]
+        sess.header_bytes = b""
+        sess.url_refreshed_at = time.monotonic()      # re-resolve is on cooldown
+
+        def refused(url, ua, headers=None, rng=None, timeout=30):
+            opens.append(url)
+            raise UpstreamError(f"HTTP 429 for {url}", status=429, retry_after=7)
+
+        eng_mod.netio.open_url = refused
+        try:
+            eng.fragment(sess, 0)
+        except UpstreamError as e:
+            assert e.status == 429
+        else:
+            assert False, "expected the 429 to propagate"
+        assert opens == ["http://cdn/live"]           # one request, not two
+        assert 6 < sess.throttle_wait() <= 7          # Retry-After honored
+
+        # a success clears the backoff for every path on this session
+        eng._clear_throttle(sess)
+        assert sess.throttle_wait() == 0
+    finally:
+        eng_mod.netio.open_url = orig_open
+        sm.shutdown()
+
+
+def test_throttle_backoff_grows_without_retry_after():
+    """Hosts that 429 without a Retry-After get an exponential wait, capped."""
+    from remuxd.netio import UpstreamError
+    cfg = Config(session_root="./.remuxd-test-backoff")
+    sm = SessionManager(cfg.session_root, 60, 4)
+    try:
+        eng = Engine(cfg, sm)
+        sess = sm.create("seek")
+        waits = []
+        for _ in range(8):
+            sess.throttled_until = 0.0        # only measure the step, not the max
+            eng._note_throttle(sess, UpstreamError("HTTP 429", status=429))
+            waits.append(sess.throttle_backoff)
+        assert waits[0] == Engine._THROTTLE_BASE
+        assert waits[1] > waits[0]                    # grows while refused
+        assert max(waits) == Engine._THROTTLE_MAX     # and is capped
+        # a non-rate-limit failure (dead link) must not arm the backoff
+        sess.throttled_until = sess.throttle_backoff = 0.0
+        eng._note_throttle(sess, UpstreamError("HTTP 404", status=404))
+        assert sess.throttle_wait() == 0
+    finally:
+        sm.shutdown()
+
+
+def test_on_demand_fragment_waits_out_a_rate_limit():
+    """A client is blocked on this fragment, so a 429 is waited out and retried
+    rather than raised (failing fast just hands the player a broken segment it
+    will re-request anyway). Read-ahead keeps failing fast."""
+    from remuxd import engine as eng_mod
+    from remuxd.netio import UpstreamError
+    cfg = Config(session_root="./.remuxd-test-wait")
+    sm = SessionManager(cfg.session_root, 60, 4)
+    orig_open = eng_mod.netio.open_url
+    try:
+        eng = Engine(cfg, sm)
+        eng._WAIT_THROTTLED_DEADLINE = 5.0      # keep the test quick
+        sess = sm.create("seek")
+        sess.src, sess.url = "http://debrid/play", "http://cdn/live"
+        sess.windows = [{"start": 0, "end": 6, "boff": 0, "bend": 10}]
+        sess.url_refreshed_at = time.monotonic()   # re-resolve on cooldown
+
+        opens = []
+
+        def refuse_twice(url, ua, headers=None, rng=None, timeout=30):
+            opens.append(url)
+            if len(opens) <= 2:
+                raise UpstreamError("HTTP 429", status=429, retry_after=0.2)
+            raise UpstreamError("HTTP 404", status=404)   # end the test cheaply
+
+        eng_mod.netio.open_url = refuse_twice
+        try:
+            eng.fragment(sess, 0, wait_throttled=True)
+        except UpstreamError as e:
+            assert e.status == 404          # got past both 429s
+        assert len(opens) == 3              # retried instead of giving up
+
+        # read-ahead's fetches still fail on the first refusal
+        opens.clear()
+        sess.throttled_until = 0.0
+        try:
+            eng.fragment(sess, 0)
+        except UpstreamError as e:
+            assert e.status == 429
+        assert len(opens) == 1
+    finally:
+        eng_mod.netio.open_url = orig_open
+        sm.shutdown()
+
+
+def test_prefetch_pace_rises_on_refusal_and_decays_on_success():
+    """Pausing only *after* a refusal makes read-ahead sawtooth into the limit, so
+    the pace rises on a refusal and relaxes only gradually."""
+    from remuxd.netio import UpstreamError
+    cfg = Config(session_root="./.remuxd-test-pace")
+    sm = SessionManager(cfg.session_root, 60, 4)
+    try:
+        eng = Engine(cfg, sm)
+        sess = sm.create("seek")
+        assert sess.prefetch_gap == 0                  # unpaced until refused
+
+        refusal = UpstreamError("HTTP 429", status=429)
+        eng._note_throttle(sess, refusal)
+        assert sess.prefetch_gap == Engine._PACE_MIN
+        eng._note_throttle(sess, refusal)
+        assert sess.prefetch_gap == Engine._PACE_MIN * 2   # doubles while refused
+        for _ in range(20):
+            eng._note_throttle(sess, refusal)
+        assert sess.prefetch_gap == Engine._PACE_MAX       # capped
+
+        # one success must NOT restore full speed (that's the sawtooth)
+        paced = sess.prefetch_gap
+        eng._clear_throttle(sess)
+        assert 0 < sess.prefetch_gap < paced
+        assert sess.throttle_wait() == 0                   # but the pause is over
+        # sustained success relaxes the pace all the way back
+        for _ in range(60):
+            eng._clear_throttle(sess)
+        assert sess.prefetch_gap == 0
+    finally:
+        sm.shutdown()
+
+
+def test_prefetch_stops_pass_while_rate_limited():
+    """Read-ahead is the load a rate-limited host can most afford to lose: the
+    worker abandons the pass on the first 429 rather than walking the rest of its
+    window into one refusal per fragment, and stays stood down until it expires."""
+    import threading
+    from remuxd.session import FragmentCache, Session
+    from remuxd.engine import PrefetchWorker
+    from remuxd.netio import UpstreamError
+
+    class RefusingEngine:
+        """Stands in for the real fetch path: refuses, and arms the session
+        backoff the way Engine.fragment does."""
+
+        def __init__(self):
+            self._prefetch_sem = threading.Semaphore(2)
+            self.calls = 0
+
+        def fragment(self, sess, i):
+            self.calls += 1
+            sess.throttled_until = time.monotonic() + 30
+            raise UpstreamError("HTTP 429", status=429)
+
+    sess = Session("throttle-test", "seek", "./.throttle-test-nodir")
+    sess.windows = [{"start": k * 6, "end": k * 6 + 6, "boff": 0, "bend": 10}
+                    for k in range(32)]
+    sess.cache = FragmentCache(64 * 1024)
+    e = RefusingEngine()
+    w = PrefetchWorker(e, sess, read_ahead=31)
+    w.start()
+    try:
+        time.sleep(1.0)
+        assert e.calls == 1              # one refused fetch, not 32
+        w.notify(4)                      # a seek must not stampede either
+        time.sleep(0.5)
+        assert e.calls == 1
+        for i in range(32):              # every claim released for on-demand
+            should, _ = sess.cache.claim(i)
+            assert should
+    finally:
+        w.stop()
+
+
+def test_retry_after_parsing():
+    """Retry-After arrives as either a delta or an HTTP date."""
+    from email.utils import format_datetime
+    from datetime import datetime, timedelta, timezone
+    from remuxd import netio
+
+    class R:
+        def __init__(self, v):
+            self.v = v
+
+        def getheader(self, name):
+            return self.v
+
+    assert netio._retry_after(R(None)) is None
+    assert netio._retry_after(R("  ")) is None
+    assert netio._retry_after(R("garbage")) is None
+    assert netio._retry_after(R("12")) == 12.0
+    assert netio._retry_after(R("-5")) == 0.0        # never a negative wait
+    soon = datetime.now(timezone.utc) + timedelta(seconds=30)
+    assert 25 < netio._retry_after(R(format_datetime(soon))) <= 30
+    past = datetime.now(timezone.utc) - timedelta(seconds=30)
+    assert netio._retry_after(R(format_datetime(past))) == 0.0
+
+
 def test_subwindow_caches_dedups_and_warms_ahead():
     """A subtitle window costs tens of MB of upstream fetch, so: a repeat request
     for the same window must not re-extract, concurrent requests for one window
@@ -579,7 +983,8 @@ def test_subwindow_caches_dedups_and_warms_ahead():
         sess.windows = [{"start": i * 6.0, "end": i * 6.0 + 6.0,
                          "boff": 1000 * i, "bend": 1000 * (i + 1)} for i in range(10)]
 
-        def fake(ffmpeg, url, hdr, boff, bend, idx, headers=None):
+        def fake(ffmpeg, url, hdr, boff, bend, idx, headers=None, start_time=0.0,
+                 open_range=None):
             calls.append((boff, bend))
             gate.wait(timeout=10)
             return b"Dialogue: 0,0:00:00.00,0:00:01.00,D,,0,0,0,,x"
@@ -618,6 +1023,89 @@ def test_subwindow_caches_dedups_and_warms_ahead():
     finally:
         eng_mod.subtitles.extract_window = orig
         gate.set()
+        sm.shutdown()
+
+
+def test_subwindow_fetch_obeys_session_throttle():
+    """A subtitle window is the same tens-of-MB fetch a video fragment is, counted
+    against the same limit, so it goes through the session's ranged opener: a 429
+    is recorded session-wide and waited out rather than abandoning the window.
+    A background warm must not sit waiting a refusal out."""
+    import threading
+    from remuxd import engine as eng_mod
+    from remuxd import netio
+    cfg = Config(session_root="./.remuxd-test-subthrottle")
+    sm = SessionManager(cfg.session_root, 60, 4)
+    orig_open, orig_ew = netio.open_url, eng_mod.subtitles.extract_window
+    try:
+        eng = Engine(cfg, sm)
+        eng._THROTTLE_BASE = 0.05           # keep the backoff sleeps test-sized
+        eng._refresh_url = lambda sess, u: u   # resolver says "same link"
+        eng._warm_subwindow = lambda *a, **k: None   # keep the warm thread out of it
+        sess = sm.create("seek")
+        sess.url, sess.header_bytes = "http://cdn/f.mkv", b"HDR"
+        sess.tracks = [{"index": 2, "path": "/x", "lang": "eng", "label": "E",
+                        "default": True}]
+        sess.windows = [{"start": i * 6.0, "end": i * 6.0 + 6.0,
+                         "boff": 1000 * i, "bend": 1000 * (i + 1)} for i in range(10)]
+
+        opens, seen_backoff = [], []
+
+        class FakeResp:
+            def read(self, n=None):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def close(self):
+                pass
+
+        def flaky_open(url, ua, headers=None, rng=None, timeout=60):
+            opens.append(rng)
+            if len(opens) == 1:                 # first attempt refused
+                raise netio.UpstreamError("HTTP 429", status=429, retry_after=0.1)
+            seen_backoff.append(sess.throttle_wait())
+            return FakeResp()
+
+        # drive the injected opener the way the real extract_window does
+        def fake_ew(ffmpeg, url, hdr, boff, bend, idx, headers=None, start_time=0.0,
+                    open_range=None):
+            assert open_range is not None, "subwindow bypassed the session opener"
+            with open_range() as r:
+                r.read(1024)
+            return b"Dialogue: 0,0:00:00.00,0:00:01.00,D,,0,0,0,,x"
+
+        netio.open_url = flaky_open
+        eng_mod.subtitles.extract_window = fake_ew
+
+        out = eng.subwindow(sess, 0, 0)          # a client is blocked on this one
+        assert b"Dialogue:" in out, "429 abandoned the window instead of retrying"
+        assert len(opens) == 2, f"expected one retry after the 429, got {opens}"
+        assert opens[0] == opens[1], "retried a different byte range"
+        # the refusal was recorded session-wide, and the retry waited it out
+        assert seen_backoff and seen_backoff[0] == 0.0, (
+            f"retried before the backoff elapsed: {seen_backoff}")
+
+        # a background warm has nobody blocked on it: it must not wait a 429 out
+        opens.clear()
+        sess.subwin.clear()
+
+        def always_429(url, ua, headers=None, rng=None, timeout=60):
+            opens.append(rng)
+            raise netio.UpstreamError("HTTP 429", status=429, retry_after=0.1)
+
+        netio.open_url = always_429
+        t0 = time.monotonic()
+        assert eng.subwindow(sess, 0, 0, warm=False) == b""
+        assert time.monotonic() - t0 < 2.0, "background warm sat waiting out a 429"
+        assert len(opens) == 1, f"background warm retried a refusal: {opens}"
+    finally:
+        netio.open_url = orig_open
+        eng_mod.subtitles.extract_window = orig_ew
         sm.shutdown()
 
 
@@ -773,6 +1261,111 @@ def test_prefetch_pauses_when_idle():
         w.stop()
 
 
+def test_subwindow_cancels_container_start_offset():
+    """On a source whose container start_time != 0, the whole-file pass rebases to
+    the start and the HLS timeline begins at 0, so a -copyts window has to be
+    shifted by start_time to agree -- otherwise every cue arrives twice and libass
+    stacks the duplicates on screen."""
+    from remuxd import subtitles
+    ass = ("[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n"
+           "Format: Name,Fontname,Fontsize,PrimaryColour,Alignment,Encoding\n"
+           "Style: D,Arial,20,&H00FFFFFF,2,1\n\n[Events]\n"
+           "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
+           "Dialogue: 0,0:00:01.00,0:00:03.00,D,,0,0,0,,hello\n")
+    import shutil as _sh
+    import tempfile
+    if not _sh.which("ffmpeg"):
+        return                                   # ffmpeg-less CI: nothing to assert
+    d = tempfile.mkdtemp()
+    apath, mpath = os.path.join(d, "s.ass"), os.path.join(d, "off.mkv")
+    with open(apath, "w") as f:
+        f.write(ass)
+    import subprocess as _sp
+    # -output_ts_offset shifts EVERY stream uniformly, so the container gets a
+    # non-zero start_time with its streams still mutually aligned
+    r = _sp.run(["ffmpeg", "-v", "error",
+                 "-f", "lavfi", "-i", "color=c=black:s=32x32:d=5", "-i", apath,
+                 "-map", "0:v", "-map", "1:s",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:s", "ass",
+                 "-output_ts_offset", "7", "-y", mpath], capture_output=True)
+    if r.returncode != 0:
+        return                                   # encoder unavailable; skip
+    blob = open(mpath, "rb").read()
+
+    class FakeRange:                      # feeds the local bytes to extract_window
+        def __init__(self, data):
+            self._d = data
+
+        def read(self, n=None):
+            d, self._d = self._d[:n], self._d[n:]
+            return d
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    orig_open = subtitles.mkvcues.open_range
+    subtitles.mkvcues.open_range = lambda *a, **k: FakeRange(blob)
+
+    def cues(**kw):
+        out = subtitles.extract_window("ffmpeg", "http://x/", b"", 0, None, 1, **kw)
+        return [ln for ln in out.decode("utf8", "replace").splitlines()
+                if ln.startswith("Dialogue:")]
+
+    # the whole-file pass (no -copyts) is the reference: it rebases to the start
+    try:
+        ref = _sp.run(["ffmpeg", "-v", "error", "-i", mpath, "-map", "0:s:0",
+                       "-c:s", "ass", "-f", "ass", "-"], capture_output=True)
+        ref_lines = [ln for ln in ref.stdout.decode("utf8", "replace").splitlines()
+                     if ln.startswith("Dialogue:")]
+        got = cues(start_time=7.0)
+        assert got and ref_lines, (got, ref_lines)
+        assert got == ref_lines, f"window {got} != whole-file {ref_lines}"
+        # without the shift they diverge, which is the duplicate-cue bug
+        assert cues(start_time=0.0) != ref_lines
+    finally:
+        subtitles.mkvcues.open_range = orig_open
+
+
+def test_serve_init_does_not_move_playhead():
+    """A player re-fetching init.mp4 after a seek must not drag read-ahead back
+    to segment 0: init.mp4 says nothing about where the client is watching."""
+    from remuxd.session import FragmentCache
+    cfg = Config(session_root="./.remuxd-test-init")
+    sm = SessionManager(cfg.session_root, 60, 4)
+    try:
+        eng = Engine(cfg, sm)
+        sess = sm.create("seek")
+        sess.windows = [{"start": i * 6, "end": i * 6 + 6,
+                         "boff": i * 100, "bend": i * 100 + 100} for i in range(20)]
+        sess.cache = FragmentCache(100000)
+
+        notified = []
+
+        class StubPrefetch:
+            def notify(self, i):
+                notified.append(i)
+                sess.playhead = i
+
+            def stop(self):
+                pass                 # Session.close() calls this on teardown
+
+        sess.prefetch = StubPrefetch()
+        eng.fragment = lambda s, i, **kw: (b"ftypxxxxmoovyyyy", b"seg-%d" % i, None)
+
+        eng.serve_segment(sess, 12)                 # client seeks to segment 12
+        assert sess.playhead == 12 and notified == [12]
+
+        sess.init = None                            # force init to be produced
+        assert eng.serve_init(sess) is not None     # still returns the init
+        assert sess.playhead == 12, "init fetch moved the playhead"
+        assert notified == [12], "init fetch re-pointed the prefetch worker"
+    finally:
+        sm.shutdown()
+
+
 def test_serve_segment_releases_claim_on_error():
     """A fragment() exception must release the in-flight claim: a leaked claim
     makes every later request for that segment block for the full wait."""
@@ -784,7 +1377,7 @@ def test_serve_segment_releases_claim_on_error():
         sess = sm.create("seek")
         sess.windows = [{"start": 0, "end": 6, "boff": 0, "bend": 10}]
         sess.cache = FragmentCache(1000)
-        eng.fragment = lambda s, i: (_ for _ in ()).throw(OSError("fetch failed"))
+        eng.fragment = lambda s, i, **kw: (_ for _ in ()).throw(OSError("fetch failed"))
         try:
             eng.serve_segment(sess, 0)
             assert False, "expected the fragment error to propagate"

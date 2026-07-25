@@ -40,7 +40,10 @@ class Config:
     session_root: str = field(
         default_factory=lambda: os.path.join(os.getcwd(), ".remuxd-sessions"))
 
-    segment_seconds: int = 6            # HLS target segment length
+    # HLS target segment length. Longer = proportionally fewer upstream requests
+    # for the same bytes, which is what debrid/CDN rate limiters count; the cost
+    # is coarser seek granularity and a slower cold start.
+    segment_seconds: int = 10
 
     # Full video-codec spec for the transcode paths (seek-transcode + singlepass).
     # Default is portable software x264; for Intel Quick Sync use e.g.
@@ -51,8 +54,12 @@ class Config:
     # Read-ahead for seek-copy: keep this many fragments ahead of the playhead
     # warm. Very high ~= download the whole file ahead (bounded by the cache); 0 off.
     prefetch_segments: int = 32
-    fragment_cache_mb: int = 512        # per-session fragment cache cap (bounds memory)
-    prefetch_concurrency: int = 6       # global cap on concurrent prefetch ffmpeg jobs
+    # Per-session cap on cached fragment bytes. Must cover what read-ahead holds
+    # (~ prefetch_segments x segment_seconds x source bitrate), or the cache
+    # evicts fragments the prefetcher just paid to fetch and they get
+    # re-downloaded. 1GB covers 32 x 10s of a ~25 Mbit/s source.
+    fragment_cache_mb: int = 1024
+    prefetch_concurrency: int = 4       # global cap on concurrent prefetch ffmpeg jobs
 
     session_ttl_seconds: int = 30 * 60  # reap after this much idle
     max_sessions: int = 32              # concurrency cap (0 = unlimited)
@@ -88,11 +95,11 @@ class Config:
             session_root=os.environ.get(
                 "REMUXD_SESSION_ROOT",
                 os.path.join(os.getcwd(), ".remuxd-sessions")),
-            segment_seconds=_int("REMUXD_SEGMENT_SECONDS", 6),
+            segment_seconds=_int("REMUXD_SEGMENT_SECONDS", 10),
             video_encode=os.environ.get("REMUXD_VIDEO_ENCODE", DEFAULT_VIDEO_ENCODE),
             prefetch_segments=_int("REMUXD_PREFETCH_SEGMENTS", 32),
-            fragment_cache_mb=_int("REMUXD_FRAGMENT_CACHE_MB", 512),
-            prefetch_concurrency=_int("REMUXD_PREFETCH_CONCURRENCY", 6),
+            fragment_cache_mb=_int("REMUXD_FRAGMENT_CACHE_MB", 1024),
+            prefetch_concurrency=_int("REMUXD_PREFETCH_CONCURRENCY", 4),
             session_ttl_seconds=_int("REMUXD_SESSION_TTL", 30 * 60),
             max_sessions=_int("REMUXD_MAX_SESSIONS", 32),
             prep_cache_ttl=_int("REMUXD_PREP_CACHE_TTL", 120),

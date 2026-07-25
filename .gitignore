@@ -8,3 +8,9 @@ dist/
 venv/
 .env
 
+.anibridge/
+.pytest_cache/
+.remuxd-test-*/
+.prep-test/
+.throttle-test-*/
+fonts/

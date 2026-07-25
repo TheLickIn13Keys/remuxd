@@ -137,10 +137,11 @@ async function showTrack(idx){
   const s=subState; if(!s) return;
   s.cur=idx;
   if(s.jassub){ try{s.jassub.destroy();}catch(e){} s.jassub=null; }
-  s.assText=''; s.passFront=0;
+  s.assText=''; s.passFront=0; s.cues=new Set();
   if(idx<0) return;                                   // "Off"
   const text=await fetchAss(s.tracks[idx].url);
-  if(text){ s.passFront=lastCueEnd(text); applyAss(text); }   // else poll retries
+  if(subState!==s||s.cur!==idx) return;         // switched again while fetching
+  if(text){ s.passFront=lastCueEnd(text); applyAss(text, s, idx); }  // else poll retries
   // The background extraction walks the file from the start, so a track picked
   // mid-playback has no cues at the playhead for as long as that pass takes to
   // get there. Pull the current window on demand instead of waiting for it.
@@ -155,19 +156,59 @@ function hasCueNear(ass, t){
   }
   return false;
 }
-// Fold newly-arrived cues into what's on screen. With nothing rendered yet this
-// adopts them wholesale, so an on-demand window can be the first thing a track
-// shows rather than waiting for the whole-file pass to reach the playhead.
-function applyAss(newAss){
-  const s=subState; if(!s) return;
-  if(!s.assText){ s.assText=newAss; renderAss(newAss); return; }
+// Union a payload's Style: lines into the header we already seeded. Every payload
+// is a separate ffmpeg run and they need not carry the same style set, so a
+// Dialogue line whose Style is only defined in a later payload would otherwise
+// render as Default ("no style named 'Main' found" from libass).
+function mergeStyles(head, newAss){
   const NL=String.fromCharCode(10);
-  const have=new Set(s.assText.split(NL).filter(l=>l.startsWith('Dialogue:')));
-  const add=newAss.split(NL).filter(l=>l.startsWith('Dialogue:')&&!have.has(l));
-  if(!add.length) return;
-  const CR=String.fromCharCode(13);
-  let base=s.assText; while(base.endsWith(NL)||base.endsWith(CR)) base=base.slice(0,-1);
-  s.assText=base+NL+add.join(NL)+NL;
+  const nameOf=l=>l.slice(6).split(',')[0].trim();
+  const lines=head.split(NL);
+  const have=new Set(), add=[];
+  let at=-1;
+  for(let i=0;i<lines.length;i++) if(lines[i].startsWith('Style:')){ have.add(nameOf(lines[i])); at=i; }
+  if(at<0) return head;                      // no [V4+ Styles] section to extend
+  for(let raw of newAss.split(NL)){
+    if(!raw.startsWith('Style:')) continue;
+    const l=raw.replace(/\r$/,'');
+    if(have.has(nameOf(l))) continue;
+    have.add(nameOf(l)); add.push(l);
+  }
+  if(!add.length) return head;
+  lines.splice(at+1, 0, ...add);
+  return lines.join(NL);
+}
+// Fold newly-arrived cues into what's on screen. With nothing rendered yet the
+// payload seeds the track, so an on-demand window can be the first thing a track
+// shows rather than waiting for the whole-file pass to reach the playhead.
+// forState/forTrack say what the caller was fetching for: every call site reads
+// the selected track before awaiting its fetch, so a payload for the previous
+// track can land after a switch has already reset the script.
+function applyAss(newAss, forState, forTrack){
+  const s=subState; if(!s) return;
+  if(forState!==s || forTrack!==s.cur) return;
+  const NL=String.fromCharCode(10), CR=String.fromCharCode(13);
+  // The two sources overlap wherever their ranges do, so filter against the cues
+  // already in the track -- updating the set as we go, so a payload that repeats
+  // a line within itself doesn't add it twice either.
+  const fresh=[];
+  for(const raw of newAss.split(NL)){
+    if(!raw.startsWith('Dialogue:')) continue;
+    const l=raw.endsWith(CR)?raw.slice(0,-1):raw;   // normalize CRLF vs LF
+    if(s.cues.has(l)) continue;
+    s.cues.add(l); fresh.push(l);
+  }
+  if(!s.assText){
+    // keep the payload's [Script Info]/[V4+ Styles]/[Events] header, but take
+    // its events from the deduped set rather than verbatim
+    const head=newAss.split(NL).filter(l=>!l.startsWith('Dialogue:')).join(NL);
+    s.assText=head.replace(/[\r\n]+$/,'')+NL+fresh.join(NL)+NL;
+    renderAss(s.assText); return;
+  }
+  if(!fresh.length) return;
+  let base=mergeStyles(s.assText, newAss);
+  while(base.endsWith(NL)||base.endsWith(CR)) base=base.slice(0,-1);
+  s.assText=base+NL+fresh.join(NL)+NL;
   if(s.jassub){ try{s.jassub.setTrack(s.assText);}catch(e){renderAss(s.assText);} }
   else renderAss(s.assText);
 }
@@ -196,14 +237,15 @@ async function subFill(t){
   if(t<=s.passFront+5) return;
   // One request per 30s region per track: a stretch with genuinely no dialogue
   // returns nothing to merge, and without this it would be re-fetched forever.
-  const bucket=s.cur+':'+Math.floor(t/30);
+  const cur=s.cur;                                    // may change across an await
+  const bucket=cur+':'+Math.floor(t/30);
   if(s.asked.has(bucket)) return;
   if(subwinBusy){ subwinPending=t; return; }          // coalesce; run it after
   s.asked.add(bucket);
   subwinBusy=true;
   try{
-    const r=await fetch(streamInfo.subwindow+'?n='+s.cur+'&t='+Math.floor(t),{cache:'no-store'});
-    if(r.ok){ const txt=await r.text(); if(txt.indexOf('Dialogue:')>=0) applyAss(txt); }
+    const r=await fetch(streamInfo.subwindow+'?n='+cur+'&t='+Math.floor(t),{cache:'no-store'});
+    if(r.ok){ const txt=await r.text(); if(txt.indexOf('Dialogue:')>=0) applyAss(txt, s, cur); }
     else s.asked.delete(bucket);                      // server-side miss -> retryable
   }catch(e){ s.asked.delete(bucket); }
   finally{
@@ -227,7 +269,7 @@ function loadSubs(tracks){
   clearSubs();
   const sel=$('subsel');
   const s={tracks, jassub:null, cur:-1, seen:tracks.map(()=>0), fonts:[], poll:null,
-           assText:'', asked:new Set(), passFront:0};
+           assText:'', asked:new Set(), passFront:0, cues:new Set()};
   subState=s;
   sel.innerHTML='<option value="-1">Off</option>'+
     tracks.map((t,i)=>`<option value="${i}">${t.label}${t.lang?' ('+t.lang+')':''}</option>`).join('');
@@ -277,13 +319,16 @@ function loadSubs(tracks){
     }
     if(s.cur<0 && ticks===1){ await showTrack(start); return; }   // "Off" is a choice
     if(s.cur<0) return;
-    const L=await len(tracks[s.cur].url);
-    if(L<0) return;
-    if(!s.jassub){ await showTrack(s.cur); return; }   // retry until it renders
-    if(L>s.seen[s.cur]){
-      const text=await fetchAss(tracks[s.cur].url);
+    const cur=s.cur;                                  // may change across an await
+    const L=await len(tracks[cur].url);
+    if(L<0||subState!==s||s.cur!==cur) return;
+    if(!s.jassub){ await showTrack(cur); return; }     // retry until it renders
+    if(L>s.seen[cur]){
+      const text=await fetchAss(tracks[cur].url);
       // only bank a length we actually read back
-      if(text){ s.seen[s.cur]=L; s.passFront=lastCueEnd(text); applyAss(text); }
+      if(text&&subState===s&&s.cur===cur){
+        s.seen[cur]=L; s.passFront=lastCueEnd(text); applyAss(text, s, cur);
+      }
     }
   };
   s.poll=setInterval(tick,3000);

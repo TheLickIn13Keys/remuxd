@@ -55,7 +55,9 @@ RUN pip install --no-cache-dir /tmp/dist/*.whl && rm -rf /tmp/dist
 # Unprivileged, with a writable session root. Sessions are pure scratch (HLS
 # fragments, extracted subs/fonts) and are cleaned up on idle and on shutdown,
 # so mount a tmpfs here if you'd rather they never touch disk:
-#   --tmpfs /var/lib/remuxd/sessions
+#   --tmpfs /var/lib/remuxd/sessions:size=4g,mode=1777
+# mode=1777 matters: a tmpfs mounts root-owned 755 over this path and hides the
+# ownership set below, leaving the unprivileged user unable to create sessions.
 RUN useradd --system --uid 10001 --create-home --home-dir /home/remuxd remuxd \
  && mkdir -p /var/lib/remuxd/sessions \
  && chown -R remuxd:remuxd /var/lib/remuxd

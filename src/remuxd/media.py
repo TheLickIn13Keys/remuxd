@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import subprocess
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from .netio import header_args
 
@@ -19,19 +19,36 @@ _RECONNECT = ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_m
 DEFAULT_VENC = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"]
 
 
+class Probe(NamedTuple):
+    """What one ffprobe call tells us about a source.
+
+    ``subs`` = TEXT subtitle streams (image subs skipped); ``audios`` = all audio
+    streams; ``aidx``/``acodec`` = the default chosen audio track (see
+    choose_audio); ``attachments`` = embedded files (fonts) with their declared
+    names; ``start_time`` = the container's start offset, which subtitle
+    timestamps are expressed relative to (the HLS timeline always begins at 0)."""
+    vcodec: str
+    pix_fmt: str
+    acodec: str
+    container: str
+    subs: List[dict]
+    aidx: Optional[int]
+    audios: List[dict]
+    duration: float
+    attachments: List[dict]
+    start_time: float
+
+
 def probe(ffprobe: str, url: str, headers: Optional[Dict[str, str]] = None,
-          ua: Optional[str] = None) -> Tuple:
-    """One ffprobe call -> (vcodec, pix_fmt, acodec, container, subs, aidx, audios,
-    duration, attachments). subs = TEXT subtitle streams (image subs skipped);
-    audios = all audio streams; aidx/acodec = the default chosen audio track (see
-    choose_audio); attachments = embedded files (fonts) with their declared names."""
+          ua: Optional[str] = None) -> Probe:
+    """One ffprobe call -> Probe."""
     h = header_args(headers)
     if ua:
         h = ["-user_agent", ua, *h]   # some CDNs 403 the default Lavf UA
     r = subprocess.run(
         [ffprobe, "-v", "error", *h, *_RECONNECT,
          "-show_entries",
-         "stream=index,codec_type,codec_name,pix_fmt:stream_tags=language,title,filename:format=format_name,duration",
+         "stream=index,codec_type,codec_name,pix_fmt:stream_tags=language,title,filename:format=format_name,duration,start_time",
          "-of", "json", url],
         capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -73,7 +90,12 @@ def probe(ffprobe: str, url: str, headers: Optional[Dict[str, str]] = None,
         duration = float(fmt.get("duration") or 0)
     except (TypeError, ValueError):
         duration = 0.0
-    return vcodec, pixfmt, acodec, container, subs, aidx, audios, duration, attachments
+    try:
+        start_time = float(fmt.get("start_time") or 0)
+    except (TypeError, ValueError):
+        start_time = 0.0
+    return Probe(vcodec, pixfmt, acodec, container, subs, aidx, audios, duration,
+                 attachments, start_time)
 
 
 def choose_audio(audios: List[dict], want_index: Optional[int] = None) -> Optional[dict]:
@@ -124,8 +146,9 @@ def build_hls_cmd(ffmpeg: str, url: str, out_dir: str, mode: str,
     decodable else re-encoded via ``venc``; audio copied when AAC/MP3 else AAC.
     Subtitles are handled out-of-band, so nothing is muxed here."""
     venc = venc or DEFAULT_VENC
-    vcodec, pix_fmt, acodec, container, subs, aidx, audios, _dur, _atts = (
-        probed or probe(ffprobe, url, headers, ua=ua))
+    pr = probed or probe(ffprobe, url, headers, ua=ua)
+    vcodec, pix_fmt, acodec = pr.vcodec, pr.pix_fmt, pr.acodec
+    container, subs, aidx, audios = pr.container, pr.subs, pr.aidx, pr.audios
     chosen = choose_audio(audios, want_audio)
     if chosen:
         aidx, acodec = chosen["index"], chosen["codec"]

@@ -1,0 +1,55 @@
+# remuxd + the AniBridge id-mapping fallback, on one network.
+#
+#   docker compose up -d --build     # start both (first anibridge boot ~2 min)
+#   docker compose logs -f remuxd
+#   docker compose down              # clean shutdown (remuxd reaps its sessions)
+#
+# Credentials and tuning come from .env (see .env.example); the few values below
+# are the ones that only make sense in this two-container layout, so they're set
+# here and override anything .env says.
+services:
+  remuxd:
+    build: .
+    image: remuxd
+    env_file: .env
+    environment:
+      REMUXD_DEMO: ${REMUXD_DEMO:-1}          # browser test player at /
+      # On this network anibridge is a hostname; .env's 127.0.0.1 (or
+      # host.docker.internal) would point at the wrong place.
+      ANIBRIDGE_URL: http://anibridge:4848
+    ports:
+      - 127.0.0.1:8000:8000
+    volumes:
+      # Fonts for releases that name system fonts instead of embedding them.
+      # Point REMUXD_FONTS_DIR at a folder you control; /System/Library/Fonts
+      # can't be shared on macOS. Mounted under a subdir so the image's own
+      # fonts stay visible. Read-only.
+      - ${REMUXD_FONTS_DIR:-./fonts}:/usr/share/fonts/host:ro
+    # Session scratch is pure ephemera (HLS fragments, extracted subs/fonts), so
+    # keep it in RAM rather than on the disk. Size it above the fragment cache:
+    # REMUXD_MAX_SESSIONS x REMUXD_FRAGMENT_CACHE_MB is the worst case.
+    # mode=1777 is required: a tmpfs mounts root-owned 755 and hides the
+    # ownership the image set up, so the unprivileged user couldn't write here.
+    tmpfs:
+      - /var/lib/remuxd/sessions:size=4g,mode=1777
+    depends_on:
+      - anibridge
+    restart: unless-stopped
+
+  # Serves the anibridge-mappings dataset (AniList -> IMDb/TMDB/TVDB) at
+  # /api/mappings. No AniBridge configuration is needed for that: it logs "No
+  # sync profiles configured" and works. First boot downloads the database
+  # (~2 min) and it refreshes daily; the volume keeps it across restarts.
+  # remuxd tolerates it being absent, so bringing it up second is fine.
+  anibridge:
+    image: ghcr.io/anibridge/anibridge:v2
+    environment:
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      UMASK: ${UMASK:-022}
+      TZ: ${TZ:-Etc/UTC}
+    ports:
+      - 127.0.0.1:4848:4848                   # its own dashboard, optional
+    volumes:
+      - ./.anibridge/data:/config
+    restart: unless-stopped

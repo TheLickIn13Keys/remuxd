@@ -49,11 +49,32 @@ docker run --rm -p 127.0.0.1:8000:8000 remuxd
 docker run --rm -p 127.0.0.1:8000:8000 --env-file .env -e REMUXD_DEMO=1 remuxd
 ```
 
+`docker-compose.yml` brings up remuxd together with the
+[AniBridge](#id-mapping-fallbacks) mapping service on one network, which is the
+easiest way to run the resolver:
+
+```sh
+docker compose up -d --build     # first anibridge boot takes ~2 min
+docker compose logs -f remuxd
+docker compose down
+```
+
+It reads `.env` for credentials and tuning, and sets only what the two-container
+layout dictates: `ANIBRIDGE_URL=http://anibridge:4848` (service name, not
+`127.0.0.1`), the demo on, session scratch on a tmpfs, and
+`REMUXD_FONTS_DIR` (default `./fonts`) mounted read-only for
+[subtitle fonts](#subtitle-fonts). AniBridge's own database lives in
+`./.anibridge/data`, so restarts don't re-download it.
+
 The image bundles `ffmpeg`/`ffprobe`, runs unprivileged, and defaults
 `REMUXD_HOST` to `0.0.0.0` (the `127.0.0.1` default would be unreachable from
 outside the container). Session scratch lives in `/var/lib/remuxd/sessions`; add
-`--tmpfs /var/lib/remuxd/sessions` to keep it off disk. `docker stop` is a clean
-shutdown: remuxd runs as PID 1 and reaps sessions on `SIGTERM`.
+`--tmpfs /var/lib/remuxd/sessions:size=4g,mode=1777` to keep it off disk — the
+`mode` is not optional, since a tmpfs mounts root-owned `755` over that path and
+hides the ownership the image set up, leaving the unprivileged user unable to
+create a session (`Permission denied: '/var/lib/remuxd/sessions/<sid>'`).
+`docker stop` is a clean shutdown: remuxd runs as PID 1 and reaps sessions on
+`SIGTERM`.
 
 **Fonts.** Releases that embed no fonts and just name system ones (see
 [Subtitle fonts](#subtitle-fonts)) need those fonts present in the container,
@@ -151,10 +172,10 @@ a font directory (see [Docker](#docker)).
 | `FFMPEG_BIN` / `FFPROBE_BIN` | `ffmpeg` / `ffprobe` | binary paths |
 | `REMUXD_VIDEO_ENCODE` | `-c:v libx264 -preset veryfast -crf 21 -pix_fmt yuv420p` | full video-codec spec for the transcode paths. Swap in a hardware encoder, e.g. Intel Quick Sync `-c:v h264_qsv -b:v 6M`, NVENC `-c:v h264_nvenc -b:v 6M`, or macOS `-c:v h264_videotoolbox -b:v 6M -pix_fmt yuv420p` |
 | `REMUXD_SESSION_ROOT` | `./.remuxd-sessions` | per-session working dirs |
-| `REMUXD_SEGMENT_SECONDS` | `6` | HLS target segment length |
+| `REMUXD_SEGMENT_SECONDS` | `10` | HLS target segment length. Rate limiters count requests, not bytes, so this is the biggest lever on upstream 429s: longer segments mean proportionally fewer requests for the same video, at the cost of coarser seeking |
 | `REMUXD_PREFETCH_SEGMENTS` | `32` | fragments to keep produced **ahead of the playhead** (seek). Set very high to download the whole file ahead; `0` disables read-ahead |
-| `REMUXD_FRAGMENT_CACHE_MB` | `512` | per-session cap on cached fragment bytes (bounds memory at high read-ahead; farthest-from-playhead fragments evicted first) |
-| `REMUXD_PREFETCH_CONCURRENCY` | `6` | global cap on concurrent prefetch ffmpeg jobs (on-demand requests are never throttled) |
+| `REMUXD_FRAGMENT_CACHE_MB` | `1024` | per-session cap on cached fragment bytes (farthest-from-playhead evicted first). Size it to cover `PREFETCH_SEGMENTS × SEGMENT_SECONDS × bitrate`, or the cache evicts fragments read-ahead just fetched and they get re-downloaded |
+| `REMUXD_PREFETCH_CONCURRENCY` | `4` | global cap on concurrent prefetch ffmpeg jobs (on-demand requests are never throttled). Mainly controls burstiness at session start; adaptive pacing governs the steady-state rate |
 | `REMUXD_SESSION_TTL` | `1800` | idle seconds before a session is reaped |
 | `REMUXD_PREP_CACHE_TTL` | `120` | seconds to memoize per-source prep (resolved URL, probe, cues index, header) so a repeat `/start` (audio switch, replay) skips it; `0` disables |
 | `REMUXD_MAX_SESSIONS` | `32` | concurrency cap (0 = unlimited). At the cap, sessions idle >60 s are evicted LRU-first; if every session is active, `/start` answers **503** instead of killing a live stream |
@@ -170,7 +191,7 @@ For the **seek** paths (copy and transcode) a background worker produces fragmen
 warm fragments instead of waiting on a byte-range fetch + remux. It refills as the
 playhead advances and evicts the fragments farthest behind first.
 
-- Default: ~32 fragments (~3 min) ahead, 512 MB/session cache.
+- Default: ~32 fragments (~5 min) ahead, 1 GB/session cache.
 - Download the whole file ahead of play: `REMUXD_PREFETCH_SEGMENTS=100000`
   (raise `REMUXD_FRAGMENT_CACHE_MB` too, since the cache is the real bound).
 - Disable and go back to strictly on-demand: `REMUXD_PREFETCH_SEGMENTS=0`.
@@ -187,12 +208,29 @@ Rough starting points; scale to your box:
   `REMUXD_VIDEO_ENCODE` to `h264_qsv` / `h264_nvenc` to offload transcoding and free
   the CPU. Copy paths (seek-copy, passthrough) don't encode at all.
 - **Memory**: worst-case RAM ≈ `REMUXD_MAX_SESSIONS × REMUXD_FRAGMENT_CACHE_MB`.
-  Defaults (32 × 512 MB ≈ 16 GB) suit a 32–64 GB box; raise the cache for deeper
-  read-ahead if you have headroom.
+  This is a cap, not an allocation: it only fills if read-ahead actually gets that
+  far. Defaults (32 × 1 GB) assume you won't run 32 fully-buffered sessions at once;
+  lower `REMUXD_MAX_SESSIONS` if you might.
 - **CPU**: `REMUXD_PREFETCH_CONCURRENCY` bounds simultaneous prefetch encodes. With
   software `libx264` on a many-thread CPU, ~half the physical cores is a safe start
   (each x264 encode is itself multi-threaded); with a hardware encoder you can go
   higher. On-demand (the segment you're actually waiting on) is never throttled.
+
+## Upstream rate limits (429)
+
+Debrid/CDN hosts rate-limit by **request count**, and read-ahead is deliberately
+request-hungry. Every large ranged read for a session — fragments, prefetch and
+on-demand subtitle windows — goes through one throttle: a 429/503 pauses the whole
+session (honoring `Retry-After`), and the read-ahead pace rises on refusal and
+decays on success, so it settles under the host's limit instead of sprinting into
+it every few seconds. A segment a player is waiting on rides the backoff out and
+retries; if it still can't be served, the player gets **503 + Retry-After**.
+
+Read the log level, not the word "refused". `[throttle …] upstream refused` at
+**INFO** is the pacing doing its job — nothing to do. At **WARNING** the backoff
+is doubling, i.e. the host is refusing faster than we back off: raise
+`REMUXD_SEGMENT_SECONDS` (fewer, larger requests) first, and lower
+`REMUXD_PREFETCH_CONCURRENCY` if the refusals cluster at session start.
 
 ## Resolver plugin (optional)
 
@@ -208,6 +246,58 @@ export AIO_PASS=...
 
 Results are memoized for `AIO_CACHE_TTL` seconds (default 300; `0` disables), so
 re-opening or re-picking a title skips the slow debrid search.
+
+### Id-mapping fallbacks
+
+The anime api on the AIOStreams instance doesn't know every AniList id, and
+searching by bare AniList id usually returns nothing. When it can't map an id
+(or is down), the resolver tries two more mappers before giving up:
+
+**1. A local [AniBridge](https://anibridge.eliasbenb.dev) instance**, serving the
+[anibridge-mappings](https://github.com/anibridge/anibridge-mappings) dataset —
+~19k AniList entries with episode-accurate links to IMDb, TMDB and TVDB,
+refreshed daily. Run it alongside remuxd; it needs no configuration of its own,
+we only read its mappings api:
+
+```sh
+docker run -d --name anibridge --restart unless-stopped \
+  -e PUID=$(id -u) -e PGID=$(id -g) -e TZ=Etc/UTC \
+  -p 4848:4848 -v ./.anibridge/data:/config \
+  ghcr.io/anibridge/anibridge:v2
+```
+
+First boot takes a minute or two while it downloads the mappings database; its
+own dashboard is at <http://127.0.0.1:4848>. If remuxd itself runs in a
+container, `127.0.0.1` is *that* container — set
+`ANIBRIDGE_URL=http://host.docker.internal:4848` (Docker Desktop), or put both on
+one docker network and use `http://anibridge:4848`. The dataset carries no IMDb
+ids for series, so series resolve to `tmdb:<id>:<season>:<episode>` (or `tvdb:`),
+which AIOStreams searches happily; films resolve to their IMDb id.
+
+**2. The [Kometa Anime-IDs](https://github.com/Kometa-Team/Anime-IDs)
+snapshot**, a ~1.7 MB JSON file downloaded once and cached on disk. It carries
+IMDb ids for only ~1500 titles (mostly films), but needs no extra service, so
+it's the fallback that works when AniBridge isn't running.
+
+| var | default | |
+|---|---|---|
+| `ANIBRIDGE_URL` | `http://127.0.0.1:4848` | instance base url |
+| `ANIBRIDGE_USER` / `ANIBRIDGE_PASS` | unset | only if it has basic auth on |
+| `ANIBRIDGE_TIMEOUT` | `5` | per-request seconds |
+| `ANIBRIDGE_CACHE_TTL` | `3600` | seconds to memoize mappings (`0` = off) |
+| `ANIBRIDGE_DISABLE` | unset | `1` skips this fallback |
+| `ANIME_IDS_URL` | the repo's `anime_ids.json` | snapshot source |
+| `ANIME_IDS_CACHE` | `<tmp>/remuxd-anime-ids.json` | on-disk copy |
+| `ANIME_IDS_TTL` | `86400` | seconds before refetch (`0` = never) |
+| `ANIME_IDS_DISABLE` | unset | `1` skips this fallback |
+
+An unreachable AniBridge is not fatal, and never sticky. A refused connection
+costs nothing, so it's simply retried on the next request — the first `/resolve`
+after the container is back resolves normally. Only a *timeout* arms a 60-second
+skip window, so a hung host can't slow every resolve down. Neither outcome is
+cached: `/resolve` memoizes results for `AIO_CACHE_TTL`, but only when the search
+actually found streams, so a blip can't leave you looking at "0 streams" until
+something restarts.
 
 ## Session lifecycle
 

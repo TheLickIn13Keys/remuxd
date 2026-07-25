@@ -136,12 +136,23 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         except Exception as e:   # never let a handler crash the connection loop
-            log.exception("handler error for %s", self.path)
             if self._response_started:
                 # headers already out, so a JSON error would land mid-body; just
                 # drop the connection so the client sees a clean failure
+                log.exception("handler error for %s", self.path)
                 self.close_connection = True
+            elif getattr(e, "status", None) in (429, 503):
+                # Upstream rate-limited us. A 500 tells the player the segment is
+                # broken and many give up on it; 503 + Retry-After is both honest
+                # and something players are built to retry. No traceback either:
+                # the engine already logged the refusal and its backoff.
+                wait = max(1, int(getattr(e, "retry_after", None) or 2))
+                log.warning("upstream rate-limited %s; 503 (retry in %ds)",
+                            self.path, wait)
+                self._send(503, json.dumps({"error": str(e)}).encode(),
+                           "application/json", {"Retry-After": str(wait)})
             else:
+                log.exception("handler error for %s", self.path)
                 self._err(500, str(e))
 
     def do_HEAD(self):

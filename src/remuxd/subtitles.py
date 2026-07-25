@@ -217,26 +217,40 @@ _WINDOW_CHUNK = 256 * 1024
 
 def extract_window(ffmpeg: str, url: str, header_bytes: bytes, boff: int,
                    bend: Optional[int], track_index: int,
-                   headers: Optional[Dict[str, str]] = None) -> bytes:
+                   headers: Optional[Dict[str, str]] = None,
+                   start_time: float = 0.0, open_range=None) -> bytes:
     """On-demand ASS for a byte window: stream clusters [boff,bend) into ffmpeg
     behind the MKV header and extract track_index with -copyts (preserve absolute
     timestamps; without it ffmpeg rebases to 0). Byte-range only, no ffmpeg HTTP
     seek.
 
+    ``open_range``: callable() -> open readable response for those bytes. This is
+    the same tens-of-MB fetch a video fragment makes, so the caller injects an
+    opener carrying its rate-limit backoff and link-refresh policy; the default
+    is a bare ranged GET.
+
     The range is piped in as it downloads rather than buffered whole first: these
     windows are tens of MB of interleaved video fetched only to recover a few
     kilobytes of text, so demuxing in parallel with the download is most of the
     post-seek latency."""
+    # -itsoffset cancels the container's start offset. -copyts alone gives
+    # absolute timestamps, but the whole-file pass rebases to the container start
+    # and the HLS timeline begins at 0; on a source with start_time != 0 the two
+    # disagree, so every cue arrives twice and libass stacks the pair on screen.
+    off = ["-itsoffset", f"-{start_time:.6f}"] if start_time else []
     p = subprocess.Popen(
         [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-         "-copyts", "-i", "pipe:0",
+         "-copyts", *off, "-i", "pipe:0",
          "-map", f"0:{track_index}", "-c:s", "ass", "-f", "ass", "pipe:1"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    feed_err: List[str] = []
 
     def feed():
         try:
             p.stdin.write(header_bytes)
-            with mkvcues.open_range(url, boff, bend, headers) as r:
+            opener = open_range or (lambda: mkvcues.open_range(url, boff, bend, headers))
+            with opener() as r:
                 while True:
                     chunk = r.read(_WINDOW_CHUNK)
                     if not chunk:
@@ -246,6 +260,11 @@ def extract_window(ffmpeg: str, url: str, header_bytes: bytes, boff: int,
             # ffmpeg exiting early (it has all the subs it needs) closes the pipe
             # under us; that's a normal finish, not a fetch failure
             log.debug("subwindow feed ended: %s", e)
+            # ...but anything other than the pipe going away is a fetch failure,
+            # and ffmpeg's stderr only shows the downstream symptom, so carry the
+            # real cause through to the warning below.
+            if not isinstance(e, (BrokenPipeError, ValueError)):
+                feed_err.append(f"{type(e).__name__}: {e}")
         finally:
             try:
                 p.stdin.close()
@@ -274,6 +293,7 @@ def extract_window(ffmpeg: str, url: str, header_bytes: bytes, boff: int,
     writer.join(timeout=5)
     drain.join(timeout=5)
     if p.returncode not in (0, None) and not out:
-        log.warning("subwindow extract failed (exit %s): %s", p.returncode,
+        log.warning("subwindow extract failed (exit %s)%s: %s", p.returncode,
+                    f" [feed: {feed_err[0]}]" if feed_err else "",
                     (err[0] if err else b"").decode(errors="replace").strip()[-300:])
     return out

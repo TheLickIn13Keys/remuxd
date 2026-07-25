@@ -104,7 +104,8 @@ class Engine:
             tl.lap("probe")
             entry = _PrepEntry(final, fsize, probed, time.monotonic())
             self._prep_put(key, entry)
-        v, pf, a, cont, subs, aidx, audios, _dur, _atts = probed
+        v, pf, a, cont = probed.vcodec, probed.pix_fmt, probed.acodec, probed.container
+        aidx, audios = probed.aidx, probed.audios
         if not v and not audios:
             raise StreamError("source has no video or audio streams "
                               "(dead link or unsupported file)")
@@ -145,8 +146,8 @@ class Engine:
         """Per-segment on-demand path (copy or transcode). Needs an MKV Cues index;
         returns None (caller falls back to singlepass) when it can't be used."""
         cfg = self.cfg
-        v, pf, a, cont, subs, aidx, audios, dur, atts = probed
-        if dur <= 0:
+        v, pf, a, cont = probed.vcodec, probed.pix_fmt, probed.acodec, probed.container
+        if probed.duration <= 0:
             return None
         if not ("matroska" in (cont or "") or "webm" in (cont or "")):
             return None
@@ -165,7 +166,7 @@ class Engine:
                 tl.lap("cues_index")
             if not plan:
                 return None
-            windows = mkvcues.segment_grid(plan, dur, cfg.segment_seconds)
+            windows = mkvcues.segment_grid(plan, probed.duration, cfg.segment_seconds)
             if not windows:
                 return None
             raw_header = mkvcues.fetch_range(final, 0, plan["header_size"], headers)
@@ -187,8 +188,9 @@ class Engine:
         sess.windows, sess.header_bytes = windows, header_bytes
         sess.aac, sess.amap, sess.file_size = aac, amap, fsize
         sess.transcode = transcode
-        sess.tracks = subtitles.sub_tracks(subs, sess.dir)
-        sess.attachments = atts
+        sess.tracks = subtitles.sub_tracks(probed.subs, sess.dir)
+        sess.attachments = probed.attachments
+        sess.start_time = probed.start_time
         sess.cache = FragmentCache(cfg.fragment_cache_bytes)
         if cfg.prefetch_segments > 0:
             sess.prefetch = PrefetchWorker(self, sess, cfg.prefetch_segments)
@@ -214,7 +216,8 @@ class Engine:
                                         ffprobe=cfg.ffprobe, venc=cfg.video_encode_args,
                                         ua=cfg.user_agent)
         sess.tracks = subtitles.sub_tracks(info.get("subs_streams") or [], sess.dir)
-        sess.attachments = probed[-1] if probed else []
+        sess.attachments = probed.attachments if probed else []
+        sess.start_time = probed.start_time if probed else 0.0
         sess.proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
         proc = sess.proc
 
@@ -267,24 +270,121 @@ class Engine:
                 sess.url = new
             return sess.url
 
-    def fragment(self, sess: Session, i: int):
+    # Backoff bounds for a rate-limited host that sends no Retry-After.
+    _THROTTLE_BASE = 2.0
+    _THROTTLE_MAX = 60.0
+
+    # Prefetch pacing (see Session.prefetch_gap). AIMD: a refusal multiplies the
+    # gap, each success decays it, so read-ahead settles just under the host's
+    # limit instead of repeatedly sprinting into it.
+    _PACE_MIN = 0.5
+    _PACE_MAX = 15.0
+    _PACE_DECAY = 0.85
+
+    def _note_throttle(self, sess: Session, exc: BaseException) -> None:
+        """Record a 429/503 so every fetch path for this session backs off, not
+        just the one that got refused. Honors Retry-After; without one the wait
+        doubles for as long as the host keeps refusing.
+
+        INFO while the backoff sits at its floor (read-ahead finding the limit and
+        settling under it, which is the design working); WARNING once it starts
+        doubling, which means we're losing ground."""
+        if getattr(exc, "status", None) not in (429, 503):
+            return
+        wait = getattr(exc, "retry_after", None)
+        with sess.throttle_lock:
+            if wait is None:
+                prev = sess.throttle_backoff or self._THROTTLE_BASE / 2
+                wait = prev * 2
+            wait = max(self._THROTTLE_BASE, min(self._THROTTLE_MAX, wait))
+            sess.throttle_backoff = wait
+            sess.throttled_until = max(sess.throttled_until, time.monotonic() + wait)
+            # Pausing alone just delays the next sprint into the limit; slow the
+            # steady-state read-ahead rate too.
+            sess.prefetch_gap = min(self._PACE_MAX,
+                                    max(self._PACE_MIN, sess.prefetch_gap * 2))
+            # same message either way, so one grep finds every refusal
+            emit = log.info if wait <= self._THROTTLE_BASE else log.warning
+            emit("[throttle %s] upstream refused (%s); backing off %.0fs, "
+                 "pacing read-ahead at %.1fs/fragment",
+                 sess.sid, getattr(exc, "status", "?"), wait, sess.prefetch_gap)
+
+    def _clear_throttle(self, sess: Session) -> None:
+        """A successful fetch means the host is serving us again. The pace decays
+        rather than dropping to zero: one success doesn't prove the limiter's
+        window has reopened, and going straight back to full speed is what makes
+        read-ahead bounce off the limit every few seconds."""
+        if sess.throttle_backoff or sess.throttled_until or sess.prefetch_gap:
+            with sess.throttle_lock:
+                sess.throttle_backoff = 0.0
+                sess.throttled_until = 0.0
+                gap = sess.prefetch_gap * self._PACE_DECAY
+                sess.prefetch_gap = 0.0 if gap < self._PACE_MIN / 2 else gap
+
+    # A client blocked on a segment waits this long across rate-limit retries
+    # before we give up. Long enough to ride out a short limiter window; short
+    # enough that a genuinely dead link still fails while the player is waiting.
+    _WAIT_THROTTLED_DEADLINE = 20.0
+    _WAIT_THROTTLED_SLEEP_MAX = 5.0
+
+    def _open_ranged(self, sess: Session, boff: int, bend, wait_throttled: bool):
+        """Open bytes [boff,bend) of the session's source under the session-wide
+        rate-limit policy, and return the open response.
+
+        Every large ranged read for a session goes through here: the host counts
+        them all against one limit, so a path that fetched around this one would
+        walk into 429s the rest of the session already knows are coming."""
+        def open_win(url):
+            return netio.open_url(url, self.cfg.user_agent, sess.headers,
+                                  rng=(boff, bend), timeout=60)
+
+        deadline = time.monotonic() + (self._WAIT_THROTTLED_DEADLINE
+                                       if wait_throttled else 0.0)
+        while True:
+            if wait_throttled:
+                # ride out a backoff another fetch already earned, instead of
+                # walking into a refusal we know is coming
+                pause = min(sess.throttle_wait(), self._WAIT_THROTTLED_SLEEP_MAX,
+                            max(0.0, deadline - time.monotonic()))
+                if pause > 0:
+                    time.sleep(pause)
+            old_url = sess.url
+            try:
+                resp = open_win(old_url)
+                break
+            except Exception as exc:
+                if getattr(exc, "status", None) in (429, 503):
+                    # Not link expiry: a re-resolve costs a resolver round-trip
+                    # and the fresh link points at the same refusing host.
+                    self._note_throttle(sess, exc)
+                    if wait_throttled and time.monotonic() < deadline:
+                        continue
+                    raise
+                new_url = self._refresh_url(sess, old_url)
+                if new_url == old_url:
+                    raise            # cooldown, or the resolver had nothing new
+                try:
+                    resp = open_win(new_url)
+                except Exception as retry_exc:   # a second failure propagates
+                    self._note_throttle(sess, retry_exc)
+                    raise
+                break
+        self._clear_throttle(sess)
+        return resp
+
+    def fragment(self, sess: Session, i: int, wait_throttled: bool = False):
         """Produce fragment i: stream its cluster bytes (+ MKV header) into ffmpeg
         as they download, so fetch and remux overlap (cold latency ~ max(fetch,
         remux) instead of their sum) and the window is never buffered whole in
         memory. Returns (init, media_bytes, err); re-resolves the link once if
-        opening the byte range fails."""
+        opening the byte range fails.
+
+        ``wait_throttled`` is for fetches a client is blocked on: a 429 is waited
+        out and retried rather than raised. Read-ahead leaves it False, yielding
+        its slot to the segments someone is actually waiting for."""
         w = sess.windows[i]
-
-        def open_win(url):
-            return netio.open_url(url, self.cfg.user_agent, sess.headers,
-                                  rng=(w["boff"], w["bend"]), timeout=60)
-
         t0 = time.perf_counter()
-        old_url = sess.url
-        try:
-            resp = open_win(old_url)
-        except Exception:
-            resp = open_win(self._refresh_url(sess, old_url))
+        resp = self._open_ranged(sess, w["boff"], w["bend"], wait_throttled)
         t_open = (time.perf_counter() - t0) * 1000
 
         t1 = time.perf_counter()
@@ -368,16 +468,20 @@ class Engine:
                   "encode" if sess.transcode else "remux", t_ff, len(out) // 1024)
         return init, media_bytes, None
 
-    def serve_segment(self, sess: Session, i: int) -> Optional[bytes]:
+    def serve_segment(self, sess: Session, i: int, move_playhead: bool = True
+                      ) -> Optional[bytes]:
         """Fragment i for a seek session: from the read-ahead cache if warm, from
         an in-flight producer if one is already fetching it (wait, don't re-fetch),
-        else produced on demand. Moves the playhead so the worker reads ahead."""
+        else produced on demand. Moves the playhead so the worker reads ahead.
+
+        ``move_playhead=False`` produces the fragment without repointing
+        read-ahead, for callers that aren't the client's actual position."""
         if i < 0 or i >= len(sess.windows):
             return None
-        if sess.prefetch:
+        if sess.prefetch and move_playhead:
             sess.prefetch.notify(i)
         if not sess.cache:
-            _init, media_bytes, _ = self.fragment(sess, i)
+            _init, media_bytes, _ = self.fragment(sess, i, wait_throttled=True)
             return media_bytes
 
         cached = sess.cache.get(i)
@@ -404,7 +508,7 @@ class Engine:
                 return sess.cache.get(i)
 
         try:
-            init, media_bytes, _err = self.fragment(sess, i)
+            init, media_bytes, _err = self.fragment(sess, i, wait_throttled=True)
         except Exception:
             sess.cache.release(i)   # never leak the claim: waiters would hang on it
             raise
@@ -421,9 +525,13 @@ class Engine:
     def serve_init(self, sess: Session):
         """The shared init.mp4 (ftyp+moov). Produced by warming segment 0 through the
         cache, so it shares the fetch with prefetch instead of duplicating it.
-        serve_segment sets sess.init as a side effect."""
+        serve_segment sets sess.init as a side effect.
+
+        Deliberately does NOT move the playhead: init.mp4 says nothing about where
+        the client is watching, and a player re-fetching it after a seek would
+        otherwise drag read-ahead back to segment 0 and abandon a warm window."""
         if sess.init is None:
-            self.serve_segment(sess, 0)
+            self.serve_segment(sess, 0, move_playhead=False)
         return sess.init
 
     # Past subtitle windows kept per session. Each is a few KB of text (the MBs
@@ -475,21 +583,19 @@ class Engine:
         out = b""
         idx = sess.tracks[n]["index"]
 
-        def extract(url):
-            return subtitles.extract_window(self.cfg.ffmpeg, url, sess.header_bytes,
-                                            boff, bend, idx, sess.headers)
+        # This pulls the same tens of MB a video fragment does, so it goes through
+        # the session's ranged opener (shared backoff, link refresh, 429 retry).
+        # Only ``warm`` calls have a client blocked on them; the background top-up
+        # must not sit waiting a refusal out.
+        def open_win():
+            return self._open_ranged(sess, boff, bend, wait_throttled=warm)
 
         try:
-            old_url = sess.url
-            try:
-                out = extract(old_url)
-            except Exception:
-                out = b""
-            if not out:   # link may have expired -> re-resolve once (serialized)
-                try:
-                    out = extract(self._refresh_url(sess, old_url))
-                except Exception:
-                    out = b""
+            out = subtitles.extract_window(
+                self.cfg.ffmpeg, sess.url, sess.header_bytes, boff, bend, idx,
+                sess.headers, start_time=sess.start_time, open_range=open_win)
+        except Exception:
+            out = b""
         finally:
             with sess.subwin_lock:
                 if out:
@@ -597,10 +703,17 @@ class PrefetchWorker(threading.Thread):
                 self._wake.clear()
                 continue
             produced = refocus = errors = False
+            throttled = 0.0
             ph = sess.playhead
             hi = min(n, ph + 1 + self.read_ahead)
             for i in range(ph, hi):
                 if self._stop.is_set():
+                    break
+                # the host is rate-limiting this session, and read-ahead is the
+                # load it can most afford to lose (on-demand fetches still go
+                # through). Stop the pass on the first refusal, not after 32.
+                throttled = sess.throttle_wait()
+                if throttled > 0:
                     break
                 if sess.playhead != ph:
                     refocus = True    # playhead moved -> rebuild the window now
@@ -617,10 +730,18 @@ class PrefetchWorker(threading.Thread):
                 try:
                     if not self._stop.is_set():
                         _init, media_bytes, _err = self.engine.fragment(sess, i)
-                except Exception:
+                except Exception as exc:
                     # a failed fetch must not kill the worker (read-ahead for the
-                    # whole session would silently stop)
-                    log.warning("[prefetch %s#%d] failed", sess.sid, i, exc_info=True)
+                    # whole session would silently stop). _note_throttle already
+                    # reported any rate-limit refusal with the backoff it chose,
+                    # so only an unexpected error gets a traceback here.
+                    if getattr(exc, "status", None) in (429, 503):
+                        log.debug("[prefetch %s#%d] %s", sess.sid, i, exc)
+                    elif getattr(exc, "status", None):
+                        log.warning("[prefetch %s#%d] %s", sess.sid, i, exc)
+                    else:
+                        log.warning("[prefetch %s#%d] failed", sess.sid, i,
+                                    exc_info=True)
                     errors = True
                 finally:
                     self.engine._prefetch_sem.release()
@@ -636,14 +757,25 @@ class PrefetchWorker(threading.Thread):
                     sess.cache.release(i)
                     if not self._stop.is_set():
                         errors = True
+                # Pace the next fetch (0 unless the host has refused us). Only
+                # once the claim is resolved: an on-demand request for this same
+                # fragment is waiting on it.
+                if sess.prefetch_gap and not self._stop.is_set():
+                    self._stop.wait(timeout=sess.prefetch_gap)
             if refocus or self._stop.is_set():
                 continue              # re-point without waiting
             if produced:
                 idle_wait = 2.0       # healthy again -> normal cadence
-            if not produced:
+            if throttled > 0:
+                # sleep out the backoff the fetch path computed (Retry-After if
+                # the host sent one). A seek wakes us; if that's early, the next
+                # pass finds the deadline still in force and comes back here.
+                self._wake.wait(timeout=min(throttled, 5.0))
+                self._wake.clear()
+            elif not produced:
                 if errors:
-                    # upstream is failing (dead link, 429): back off instead of
-                    # re-hitting it every 2s (a seek/wake still resumes instantly)
+                    # upstream is failing (dead link, expired token): back off
+                    # instead of re-hitting it every 2s (a seek still resumes)
                     idle_wait = min(60.0, idle_wait * 2)
                 self._wake.wait(timeout=idle_wait)
                 self._wake.clear()

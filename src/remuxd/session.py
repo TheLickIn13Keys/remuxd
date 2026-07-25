@@ -132,10 +132,27 @@ class Session:
         self.subwin_lock = threading.Lock()
         # attachment streams from the probe (embedded fonts), for explicit dumping
         self.attachments: List[dict] = []
+        # container start offset; subtitle windows are shifted by it so their
+        # timestamps line up with the player's 0-based HLS timeline
+        self.start_time: float = 0.0
         # last debrid re-resolve (monotonic); throttles resolver lookups (429s)
         self.url_refreshed_at: float = 0.0
+        # Rate-limit backoff shared by every fetch path for this session: a 429 on
+        # one fragment means the *host* is refusing us, so read-ahead stands down
+        # too instead of walking the rest of its window into more 429s.
+        self.throttle_lock = threading.Lock()
+        self.throttled_until: float = 0.0   # monotonic deadline
+        self.throttle_backoff: float = 0.0  # current wait, doubles while refused
+        # Minimum seconds between prefetch fetches, rising on a refusal and
+        # decaying back to 0 on success. Pausing only *after* a 429 makes
+        # read-ahead sawtooth into the limit; this paces it to just under.
+        self.prefetch_gap: float = 0.0
         # singlepass
         self.proc: Optional[subprocess.Popen] = None
+
+    def throttle_wait(self) -> float:
+        """Seconds left on this session's rate-limit backoff (0 when clear)."""
+        return max(0.0, self.throttled_until - time.monotonic())
 
     @property
     def on_demand(self) -> bool:

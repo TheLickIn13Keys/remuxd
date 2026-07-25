@@ -3,6 +3,9 @@
 Maps an AniList id to an IMDb id (richer stream pool), searches an AIOStreams
 instance, and ranks the results for *browser playability* (copy-friendly codecs
 and instant/cached sources first). Returns the ranked list for ``/resolve``.
+When the instance's anime api can't map the id, we retry against a local
+``anibridge`` instance (IMDb/TMDB/TVDB, episode-accurate) and then the offline
+Kometa ``animeids`` snapshot; failing both we search by AniList id directly.
 
 Configuration is env-only (no baked-in credentials):
     AIO_INSTANCE   e.g. https://aiostreams.example.com
@@ -20,6 +23,7 @@ import urllib.parse
 import urllib.request
 
 from ..timing import Timeline
+from . import anibridge, animeids
 
 log = logging.getLogger("remuxd.resolve")
 
@@ -65,18 +69,24 @@ def _http_json(url: str, auth: bool = False):
 
 
 def _map_to_imdb(anilist_id):
-    """AniList id -> (imdb_id, is_movie, imdb_season, from_episode)."""
+    """AniList id -> (imdb_id, is_movie, imdb_season, from_episode).
+
+    Any field may be None when the api doesn't know it; ``is_movie`` is None
+    (rather than False) when the api gave us no type at all, so the caller can
+    tell "not a movie" apart from "unknown".
+    """
     q = urllib.parse.urlencode({"idType": "anilistId", "idValue": anilist_id})
     try:
         data = _http_json(f"{_instance()}/api/v1/anime?{q}").get("data")
-    except urllib.error.HTTPError:
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        log.debug("[resolve] anime api lookup failed for %s: %s", anilist_id, exc)
         return None, None, None, None
     if not data:
         return None, None, None, None
     mappings = data.get("mappings") or {}
     imdb = mappings.get("imdbId") or data.get("imdbId") or data.get("imdb_id")
     atype = (data.get("type") or "").upper()
-    is_movie = atype in ("MOVIE", "FILM")
+    is_movie = atype in ("MOVIE", "FILM") if atype else None
     imdb_block = data.get("imdb") or {}
     return imdb, is_movie, imdb_block.get("seasonNumber"), imdb_block.get("fromEpisode")
 
@@ -176,6 +186,27 @@ def parse_id(token: str):
     return token, 1, 1
 
 
+def _fallback_media(anilist, season, episode, is_movie):
+    """(media_id, media_type) from the offline mappers, or (None, None).
+
+    AniBridge first (episode-accurate, knows the most titles), then the Kometa
+    Anime-IDs snapshot, which still covers a few hundred films AniBridge lacks.
+    """
+    media_id, media_type = anibridge.lookup(anilist, episode)
+    if media_id:
+        log.info("[resolve] anibridge fallback: anilist %s ep %s -> %s",
+                 anilist, episode, media_id)
+        return media_id, media_type
+    imdb, kometa_movie, imdb_season, from_episode = animeids.lookup(anilist)
+    if imdb:
+        log.info("[resolve] anime-ids fallback: anilist %s -> %s", anilist, imdb)
+        movie = kometa_movie if is_movie is None else is_movie
+        if movie:
+            return imdb, "movie"
+        return _imdb_media_id(imdb, imdb_season, from_episode, season, episode), "series"
+    return None, None
+
+
 def _resolve_streams(anilist, season=1, episode=1, tl=None):
     media_id, media_type = None, "series"
     imdb, is_movie, imdb_season, from_episode = _map_to_imdb(anilist)
@@ -185,8 +216,12 @@ def _resolve_streams(anilist, season=1, episode=1, tl=None):
         media_id = imdb if is_movie else \
             _imdb_media_id(imdb, imdb_season, from_episode, season, episode)
         media_type = "movie" if is_movie else "series"
+    else:                        # api couldn't map it (or is down): offline mappers
+        media_id, media_type = _fallback_media(anilist, season, episode, is_movie)
+        if tl:
+            tl.lap("fallback")
     if not media_id:
-        media_id = f"anilist:{anilist}:{episode}"
+        media_id, media_type = f"anilist:{anilist}:{episode}", "series"
     results = _search(media_id, media_type)
     if tl:
         tl.lap("search")
@@ -228,7 +263,10 @@ def resolve_api(anilist_token: str) -> dict:
     } for r in ranked]
     tl.done(f"{media_id} results={len(results)}")
     result = {"media_id": media_id, "results": results}
-    if ttl > 0:
+    # Never memoize an empty search: it usually means something upstream was
+    # briefly unhappy (a mapper still booting, a debrid timeout), and caching it
+    # turns one bad click into TTL seconds of "0 streams" that only a restart clears.
+    if ttl > 0 and results:
         with _cache_lock:
             if len(_cache) >= _CACHE_MAX and token not in _cache:
                 _cache.pop(min(_cache, key=lambda k: _cache[k][0]), None)
